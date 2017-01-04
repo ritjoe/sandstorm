@@ -21,6 +21,7 @@ set -euo pipefail
 XVFB_PID=""
 RUN_SELENIUM="${RUN_SELENIUM:-true}"
 BUNDLE_PATH=""
+SANDSTORM_TESTAPP_PATH=""
 THIS_DIR=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 METEOR_DEV_BUNDLE=$("$THIS_DIR/../find-meteor-dev-bundle.sh")
 NODEJS="$METEOR_DEV_BUNDLE/bin/node"
@@ -32,14 +33,21 @@ SELENIUM_DOWNLOAD_URL="https://selenium-release.storage.googleapis.com/2.53/$SEL
 cleanExit () {
   rc=$1
 
-  if [ $rc != 0 ]; then
+  if [ $rc -ne 0 ]; then
     echo "Log output: "
     cat "$SANDSTORM_DIR/var/log/sandstorm.log"
   fi
 
   "$SANDSTORM_DIR/sandstorm" stop
   sleep 1
-  rm -rf "$SANDSTORM_DIR"
+
+  if [ $rc -eq 0 ]; then
+    # Only clean up the test directory if the test run was successful - if tests failed,
+    # it's nice to be able to inspect the logs.  We wipe out $SANDSTORM_DIR before starting
+    # a new test run, so this is fine.
+    rm -rf "$SANDSTORM_DIR"
+  fi
+
   if [ -n "$XVFB_PID" ] ; then
     # Send SIGINT to the selenium-server child of the backgrounded xvfb-run, so
     # it will exit cleanly and the Xvfb process will also be cleaned up.
@@ -78,20 +86,31 @@ while [ $# -gt 0 ] ; do
       RUN_SELENIUM="false"
       ;;
     *)
-      if [ -n "$BUNDLE_PATH" ]; then
-        echo "Multiple bundle paths specified, please name only one."
+      if [ -n "$SANDSTORM_TESTAPP_PATH" ]; then
+        echo "Too many arguments. Please specify Sandstorm bundle and test app SPK as two arguments."
         exit 1
+      elif [ -n "$BUNDLE_PATH" ]; then
+        SANDSTORM_TESTAPP_PATH=$(readlink -f "$1")
+      else
+        BUNDLE_PATH=$(readlink -f "$1")
       fi
-      BUNDLE_PATH=$(readlink -f "$1")
       ;;
   esac
   shift
 done
 
 if [ -z "$BUNDLE_PATH" ] ; then
-  echo "No bundle path specified; perhaps you meant to write '$0 sandstorm-0-fast.tar.xz'?"
+  echo "No bundle path specified; perhaps you meant to write '$0 sandstorm-0-fast.tar.xz test-app.spk'?"
   exit 1
 fi
+
+if [ -z "$SANDSTORM_TESTAPP_PATH" ] ; then
+  echo "No test app path specified; perhaps you meant to write '$0 $BUNDLE_PATH test-app.spk'?"
+  exit 1
+fi
+
+# We'll use this env var from the tests.
+export SANDSTORM_TESTAPP_PATH
 
 cd "$THIS_DIR"
 

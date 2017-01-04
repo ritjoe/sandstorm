@@ -52,6 +52,37 @@
     margin: 4px;
     text-decoration: none;
   }
+
+  .setup-system-log {
+    color: #000000;
+  }
+
+  .setup-system-log-header {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+
+    .setup-system-log-header-text {
+      font-size: 24px;
+      font-weight: normal;
+    }
+  }
+}
+
+.setup-intro-instruction-block {
+  text-align: center;
+  margin-top: 1em;
+  margin-bottom: 1em;
+}
+
+.setup-intro-instruction {
+  margin: 0;
+}
+
+.setup-intro-instruction-deemphasized {
+  margin: 0;
+  color: #888;
 }
 
 .setup-progress {
@@ -68,15 +99,27 @@
   justify-content: center;
 }
 
+.setup-current-step {
+  color: black;
+}
+
+span.setup-not-current-step {
+  color: #888;
+}
+
+a.setup-not-current-step {
+  text-decoration: none;
+}
+
 .setup-progress-step {
   // base percent to flex: should be 100%/(num_steps + 1) to make the steps' labels line up with
   // the endpoints of the progress bars below, but the number of steps varies, so we need to set
   // the size depending on how many there are.
   &.of-four {
-    flex: 0 1 25%;
+    flex: 0 1 20%;
   }
   &.of-five {
-    flex: 0 1 20%;
+    flex: 0 1 16.66%;
   }
   display: flex;
   flex-direction: column;
@@ -104,10 +147,6 @@
   }
 }
 
-.setup-welcome {
-  text-align: center;
-}
-
 .setup-type-selection {
   display: flex;
   flex-direction: row;
@@ -118,7 +157,7 @@
 
 .setup-type {
   flex: 1 1 auto;
-  min-width: 300px;
+  min-width: 280px;
   background-color: #fff;
   border: 1px solid #d0d0d0;
   border-radius: 4px;
@@ -132,7 +171,7 @@
   h3 {
     text-align: center;
     font-size: 20px;
-    font-weight: 600;
+    font-weight: normal;
     margin-left: 0px;
     margin-right: 0px;
     margin-top: 0px;
@@ -144,22 +183,83 @@
     flex: 1 1 auto;
     list-style-type: none;
     padding-left: 12px;
-    margin-top: 0;
-    margin-bottom: 16px;
+    margin-top: 8px;
+    margin-bottom: 0px;
 
     .setup-additional-feature {
       color: #888;
     }
     >li {
-      margin-bottom: 8px;
-    }
+      &:not(:last-child) {
+        margin-bottom: 14px;
+      }
+      font-size: 20px;
 
-    border-bottom: 1px solid #aaa
+      &.muted {
+        color: #aaa;
+      }
+
+      .feature-list {
+        list-style-type: none;
+        font-size: 14px;
+        padding-left: 0;
+        >li {
+          margin-top: .5em;
+          margin-bottom: .5em;
+        }
+        .checkbox {
+          display: inline-block;
+          width: 14px;
+          height: 14px;
+        }
+      }
+    }
   }
 
   .setup-pricing-block {
-    text-align: center;
+    display: inline-flex;
+    flex-direction: row;
+    align-items: flex-start;
+    justify-content: stretch;
+    width: calc(100% + 20px);
+    min-height: 96px;
+
     margin-bottom: 8px;
+    background-color: #f4f4f4;
+
+    .image {
+      display: block;
+      height: 80px;
+      margin-top: 16px;
+      flex: 1 1 35%;
+      background-size: contain;
+      background-repeat: no-repeat;
+      &.standard {
+        background-image: url('/standard-install.svg');
+      }
+      &.sfw {
+        background-image: url('/sfw-install.svg');
+      }
+    }
+
+    .text {
+      display: block;
+      height: 100%;
+      flex: 1 1 65%;
+      margin-top: 16px;
+
+      .price {
+        font-size: 36px;
+        color: #565656;
+        .former-price {
+          color: #aaa;
+        }
+      }
+      .price-notes {
+        font-size: 14px;
+      }
+    }
+
     .setup-price {
       font-size: 24px;
       margin-top: 0px;
@@ -177,9 +277,30 @@
     text-align: center;
     width: 100%;
     @extend %button-base;
-    @extend %button-primary;
     height: 32px;
     font-size: 16px;
+  }
+  button.setup-sandstorm-standard {
+    background-color: #962751;
+    color: white;
+    border: 1px solid darken(#962751, 10%);
+    &:hover {
+      background-color: lighten(#962751, 10%);
+    }
+    &:disabled {
+      @extend %button-disabled;
+    }
+  }
+  button.setup-sandstorm-for-work {
+    background-color: #4049a7;
+    color: white;
+    border: 1px solid darken(#4049a7, 10%);
+    &:hover {
+      background-color: lighten(#4049a7, 10%);
+    }
+    &:disabled {
+      @extend %button-disabled;
+    }
   }
 }
 
@@ -223,6 +344,74 @@
   }
 }
 
+.setup-preinstall {
+  [role=grid] {
+    margin-bottom: 10px;
+
+    [role=row] {
+      display: flex;
+      flex-direction: row;
+      justify-content: flex-start;
+      border-top: 1px solid $default-table-border-color;
+      flex-basis: 0;
+      width: 100%;
+
+      &.checked, &.toggle-more {
+        background-color: white;
+        [role=row] {
+          border-top: 1px solid $default-content-background-color;
+        }
+      }
+
+      &.toggle-more {
+        cursor: pointer;
+        div {
+          margin-left: auto;
+        }
+      }
+
+      [role=gridcell] {
+        padding: 4px;
+        overflow: hidden;
+        @include overflow-ellipsis();
+        flex-grow: 0;
+        &.name {
+          width: 20%;
+        }
+        &.description {
+          width: 70%;
+          color: #888888;
+        }
+        &.download {
+          width: 130px;
+          color: #888888;
+          i.download-checkmark {
+            color: green;
+            @extend .icon;
+            @extend .icon-check;
+            margin-right: 5px;
+          }
+          i.download-x-mark {
+            color: red;
+            @extend .icon;
+            @extend .icon-plus;
+            margin-right: 5px;
+            -ms-transform: rotate(45deg);
+            -webkit-transform: rotate(45deg);
+            transform: rotate(45deg);
+          }
+          progress {
+            width: 115px;
+            &::-webkit-progress-value {
+              background-color: green;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 .setup-next-steps {
   display: flex;
   flex-direction: row;
@@ -253,7 +442,7 @@
   margin-right: auto;
 }
 
-.setup-test-email-button, .setup-skip-email {
+.setup-test-email-button, .setup-skip-email, .setup-skip-button {
   @extend %button-base;
   @extend %button-secondary;
   margin-left: 10px;
@@ -293,74 +482,6 @@
 
 .rerun-wizard-button {
   @extend %button-secondary;
-}
-
-.modal-backdrop {
-  position: fixed;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  z-index: 1000;
-  background-color: #000;
-  opacity: .5;
-}
-
-.modal {
-  position: fixed;
-  left: 0;
-  right: 0;
-  top: 0;
-  bottom: 0;
-  opacity: 1;
-  z-index: 1010;
-  display: block;
-  overflow-y: auto;
-}
-
-.modal-dialog {
-  position: relative;
-  width: 600px;
-  margin-top: 36px;
-  margin-bottom: auto;
-  margin-left: auto;
-  margin-right: auto;
-}
-
-.modal-close-button {
-  display: block;
-  position: absolute;
-  top: 0;
-  right: 0;
-  width: 32px;
-  height: 32px;
-  color: transparent;
-  overflow: hidden;
-  background-image: url("/close-m.svg");
-  background-size: 20px 20px;
-  background-repeat: no-repeat;
-  background-position: center;
-  border: none;
-  border-radius: 16px;
-  background-color: transparent;
-  margin: 0;
-  &:hover {
-    background-color: #eee;
-    cursor: pointer;
-  }
-}
-
-.modal-content {
-  min-height: 32px;
-  background-color: #fff;
-  opacity: 1;
-  padding: 24px;
-  >h2 {
-    font-weight: normal;
-    margin: 0;
-    margin-bottom: 24px;
-    border-bottom: 1px solid #ddd;
-  }
 }
 
 .sandstorm-logo-row {

@@ -15,53 +15,11 @@
 // limitations under the License.
 
 const Future = Npm.require("fibers/future");
-const Promise = Npm.require("es6-promise").Promise;
 const Capnp = Npm.require("capnp");
 const Url = Npm.require("url");
 const Http = Npm.require("http");
 const Https = Npm.require("https");
 const ApiSession = Capnp.importSystem("sandstorm/api-session.capnp").ApiSession;
-
-WrappedUiView = class WrappedUiView {
-  constructor(token, proxy) {
-    // TODO(someday): handle the fact that these proxies will be garbage collected every 2 minutes,
-    // even if it's in use.
-    this.token = token;
-    this.proxy = proxy;
-  }
-
-  newSession(userInfo, context, sessionType, sessionParams, retryCount) {
-    if (sessionType !== ApiSession.typeId) {
-      throw new Error("SessionType must be ApiSession.");
-    }
-
-    retryCount = retryCount || 0;
-    const _this = this;
-
-    return this.proxy.keepAlive().then(() => {
-      // ignore the passed userInfo and instead use the one associated with this
-      // token TODO(someday): Merge / intersect the two userInfo objects
-      // (especially permissions) rather than only taking the token's user info.
-      // This will allow the caller to request only a subset of the permissions
-      // granted by the token, which is useful to protect against bugs.
-      const session = _this.proxy.uiView.newSession(
-          _this.proxy.userInfo, context, sessionType, sessionParams).session;
-      return { session: session };
-    }).catch((error) => {
-      return _this.proxy.maybeRetryAfterError(error, retryCount).then(() => {
-        return _this.newSession(userInfo, context, sessionType, sessionParams, retryCount + 1);
-      });
-    });
-  }
-};
-
-getWrappedUiViewForToken = (token) => {
-  const proxyPromise = getProxyForApiToken(token);
-
-  return proxyPromise.then((proxy) => {
-    return { view: new WrappedUiView(token, proxy) };
-  });
-};
 
 ExternalUiView = class ExternalUiView {
   constructor(url, grainId, token) {
@@ -167,7 +125,15 @@ ExternalWebSession = class ExternalWebSession {
     return new Promise((resolve, reject) => {
       const options = _.clone(session.options);
       options.headers = options.headers || {};
-      options.path = path;
+
+      // According to the specification of `WebSession`, `path` should not contain a
+      // leading slash, and therefore we need to prepend "/". However, for a long time
+      // this implementation did not in fact prepend a "/". Since some apps might rely on
+      // that behavior, we only prepend "/" if the path does not start with "/".
+      //
+      // TODO(soon): Once apps have updated, prepend "/" unconditionally.
+      options.path = path.startsWith("/") ? path : "/" + path;
+
       options.method = method;
       if (contentType) {
         options.headers["content-type"] = contentType;

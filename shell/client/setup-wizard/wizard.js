@@ -1,10 +1,22 @@
+import SandstormAccountSettingsUi from "/imports/client/accounts/account-settings-ui.js";
+import AccountsUi from "/imports/client/accounts/accounts-ui.js";
+import downloadFile from "/imports/client/download-file.js";
+
 // Pseudocollection telling the client if there's an admin user yet.
 HasAdmin = new Mongo.Collection("hasAdmin");
 
 const AdminToken = new Mongo.Collection("adminToken"); // see Meteor.publish("adminToken")
 
-const setupSteps = ["intro", "identity", "email", "user", "success"];
-const setupStepsForWork = ["intro", "identity", "organization", "email", "user", "success"];
+const setupSteps = ["intro", "identity", "email", "preinstalled", "user", "success"];
+const setupStepsForWork = [
+  "intro",
+  "identity",
+  "organization",
+  "email",
+  "preinstalled",
+  "user",
+  "success",
+];
 
 // Combined with the list of steps above to DRY up the ordering.
 const setupStepRouteMap = {
@@ -12,6 +24,7 @@ const setupStepRouteMap = {
   identity: "setupWizardIdentity",
   organization: "setupWizardOrganization",
   email: "setupWizardEmailConfig",
+  preinstalled: "setupWizardPreinstalled",
   user: "setupWizardLoginUser",
   success: "setupWizardSuccess",
 };
@@ -53,6 +66,10 @@ const setupIsStepCompleted = {
     } else {
       return true;
     }
+  },
+
+  preinstalled() {
+    return globalDb.isPreinstalledAppsReady();
   },
 
   user() {
@@ -128,7 +145,7 @@ Template.setupWizardProgressBar.helpers({
 Template.setupWizardProgressBarItem.helpers({
   linkClassName() {
     const instance = Template.instance();
-    return instance.data.isCurrentStep ? "setup-current-step" : "";
+    return instance.data.isCurrentStep ? "setup-current-step" : "setup-not-current-step";
   },
 });
 
@@ -139,6 +156,75 @@ Template.setupWizardVerifyToken.helpers({
 
   rejected() {
     return Iron.controller().state.get("redeemStatus") === "rejected";
+  },
+});
+
+Template.setupWizardHelpFooter.onCreated(function () {
+  this.showSystemLogOverlay = new ReactiveVar(false);
+});
+
+Template.setupWizardHelpFooter.helpers({
+  showSystemLog() {
+    const instance = Template.instance();
+    return instance.showSystemLogOverlay.get();
+  },
+
+  hideSystemLogCallback() {
+    const instance = Template.instance();
+    return () => {
+      instance.showSystemLogOverlay.set(false);
+    };
+  },
+});
+
+Template.setupWizardHelpFooter.events({
+  "click button[name=system-log]"() {
+    const instance = Template.instance();
+    instance.showSystemLogOverlay.set(true);
+  },
+});
+
+Template.setupWizardSystemLog.onCreated(function () {
+  const token = sessionStorage.getItem("setup-token");
+  this.token = token;
+  if (this.token) {
+    this.adminTokenSub = this.subscribe("adminToken", token);
+  }
+
+  this.adminLogSub = this.subscribe("adminLog", token);
+});
+
+Template.setupWizardSystemLog.helpers({
+  ready() {
+    const instance = Template.instance();
+    return (!instance.token || instance.adminTokenSub.ready()) &&
+        instance.adminLogSub.ready();
+  },
+
+  isUserPermitted() {
+    const instance = Template.instance();
+    let tokenStatus = undefined;
+    if (instance.token) {
+      tokenStatus = AdminToken.findOne();
+    }
+
+    const isUserPermitted = isAdmin() || (tokenStatus && tokenStatus.tokenIsValid);
+    return isUserPermitted;
+  },
+});
+
+Template.setupWizardSystemLog.events({
+  "click button[name=download-full-log]"(evt) {
+    Meteor.call("adminGetServerLogDownloadToken", sessionStorage.getItem("setup-token"),
+        (err, token) => {
+      if (err) {
+        console.log(err.message);
+      } else {
+        const url = "/admin/status/server-log/" + token;
+        const suggestedFilename = "sandstorm.log";
+        downloadFile(url, suggestedFilename);
+      }
+    });
   },
 });
 
@@ -156,6 +242,10 @@ Template.setupWizardIntro.helpers({
     return hasUsersEntry && hasUsersEntry.hasUsers;
   },
 
+  noIdpEnabled() {
+    return !setupIsStepCompleted.identity();
+  },
+
   currentUserIsAdmin() {
     return isAdmin();
   },
@@ -165,7 +255,7 @@ Template.setupWizardIntro.helpers({
     return instance.showSignInPanel.get();
   },
 
-  identityUser: function () {
+  identityUser() {
     const user = Meteor.user();
     return user && user.profile;
   },
@@ -429,11 +519,11 @@ Template.setupWizardOrganization.events({
       membership: {
         emailToken: {
           enabled: instance.emailChecked.get(),
-          domain: instance.emailDomain.get(),
+          domain: instance.emailDomain.get().trim(),
         },
         google: {
           enabled: instance.gappsChecked.get(),
-          domain: instance.gappsDomain.get(),
+          domain: instance.gappsDomain.get().trim(),
         },
         ldap: {
           enabled: instance.ldapChecked.get(),
@@ -478,13 +568,13 @@ Template.setupWizardEmailConfig.onCreated(function () {
   this.getSmtpConfig = () => {
     const portValue = parseInt(this.smtpPort.get());
     const smtpConfig = {
-      hostname: this.smtpHostname.get(),
+      hostname: this.smtpHostname.get().trim(),
       port: _.isNaN(portValue) ? 25 : portValue,
       auth: {
         user: this.smtpUsername.get(),
         pass: this.smtpPassword.get(),
       },
-      returnAddress: this.smtpReturnAddress.get(),
+      returnAddress: this.smtpReturnAddress.get().trim(),
     };
     return smtpConfig;
   };
@@ -629,6 +719,86 @@ Template.setupWizardEmailConfig.helpers({
   },
 });
 
+Template.setupWizardPreinstalled.onCreated(function () {
+  this.appIndexSubscription = this.subscribe("appIndexAdmin",
+    Iron.controller().state.get("token"));
+  this.packageSubscription = this.subscribe("allPackages",
+    Iron.controller().state.get("token"));
+});
+
+Template.setupWizardPreinstalled.events({
+  "click .setup-back-button"(ev, instance) {
+    Router.go(getRouteBefore("preinstalled"));
+  },
+
+  "click .setup-next-button"(ev, instance) {
+    // Actually do nothing, since apps are already pre-installed and ready
+    Router.go(getRouteAfter("preinstalled"));
+  },
+
+  "click .setup-skip-button"(ev, instance) {
+    Meteor.call("setPreinstalledApps", []);
+    // Overwrite the default setting for "setPreinstalledApps"
+    Router.go(getRouteAfter("preinstalled"));
+  },
+});
+
+Template.setupWizardPreinstalled.helpers({
+  allowNext() {
+    return globalDb.isPreinstalledAppsReady();
+  },
+
+  allowSkip() {
+    const instance = Template.instance();
+    const apps = globalDb.collections.appIndex.find({ _id: {
+      $in: globalDb.getProductivitySuiteAppIds().concat(
+        globalDb.getSystemSuiteAppIds()), },
+    }).fetch();
+    const appIndexCount = globalDb.collections.appIndex.find({}).count();
+    const failedAppsCount = globalDb.collections.packages.find({
+      _id: {
+        $in: _.pluck(apps, "packageId"),
+      },
+      status: "failed",
+    }).count();
+    return (instance.appIndexSubscription.ready() && appIndexCount === 0) ||
+      failedAppsCount !== 0;
+  },
+
+  preinstallApps() {
+    const allAppIds = globalDb.getProductivitySuiteAppIds().concat(
+      globalDb.getSystemSuiteAppIds());
+    return globalDb.collections.appIndex.find({ _id: {
+      $in: allAppIds, },
+    }, { sort: { name: 1 } });
+  },
+
+  isAppDownloaded() {
+    const pack = globalDb.collections.packages.findOne({ _id: this.packageId });
+    return pack && pack.status === "ready";
+  },
+
+  isAppDownloading() {
+    const pack = globalDb.collections.packages.findOne({ _id: this.packageId });
+    return pack && _.contains(["verify", "unpack", "analyze", "download"], pack.status);
+  },
+
+  isAppFailed() {
+    const pack = globalDb.collections.packages.findOne({ _id: this.packageId });
+    return pack && pack.status === "failed";
+  },
+
+  progressFraction() {
+    const pack = globalDb.collections.packages.findOne({ _id: this.packageId });
+    if (_.contains(["verify", "unpack", "analyze"], pack.status)) {
+      // Downloading is done
+      return 1;
+    }
+
+    return pack && pack.progress;
+  },
+});
+
 Template.setupWizardLoginUser.onCreated(function () {
   this.triedRedeemingToken = false;
   this.errorMessage = new ReactiveVar(undefined);
@@ -656,7 +826,7 @@ Template.setupWizardLoginUser.helpers({
       staticHost: window.location.protocol + "//" + makeWildcardHost("static"),
       db: globalDb,
       hideButtons: true,
-      setActionCompleted: function (result) {
+      setActionCompleted(result) {
         if (result.success) {
           instance.successMessage.set(result.success);
         } else if (result.error) {
@@ -678,7 +848,7 @@ Template.setupWizardLoginUser.helpers({
     return !Meteor.loggingIn() && Meteor.user() && !Meteor.user().hasCompletedSignup;
   },
 
-  identityUser: function () {
+  identityUser() {
     const user = Meteor.user();
     return user && user.profile;
   },
@@ -781,7 +951,7 @@ Template.setupWizardSuccess.events({
 });
 
 const setupRoute = RouteController.extend({
-  waitOn: function () {
+  waitOn() {
     const token = sessionStorage.getItem("setup-token");
     const subs = [
       Meteor.subscribe("admin", token),
@@ -798,11 +968,10 @@ const setupRoute = RouteController.extend({
     return subs;
   },
 
-  action: function () {
+  action() {
     const token = sessionStorage.getItem("setup-token");
     const state = this.state;
     state.set("token", token);
-    // Using AdminToken pseudocollection from admin-client.js
     let tokenStatus = undefined;
     if (token) {
       tokenStatus = AdminToken.findOne();
@@ -810,16 +979,18 @@ const setupRoute = RouteController.extend({
 
     const isUserPermitted = isAdmin() || (tokenStatus && tokenStatus.tokenIsValid);
     if (!isUserPermitted) {
-      Router.go("setupWizardTokenExpired");
+      Router.go("setupWizardTokenExpired", {}, { replaceState: true });
     }
 
     this.render();
   },
 
-  onAfterAction: function () {
+  onAfterAction() {
     // Scroll to the top of the page each time you navigate to a setup wizard page.
     document.getElementsByTagName("body")[0].scrollTop = 0;
   },
+
+  loadingTemplate: "setupWizardLoading",
 });
 
 Template.setupWizardTokenExpired.helpers({
@@ -855,6 +1026,11 @@ Router.map(function () {
     layoutTemplate: "setupWizardLayout",
     controller: setupRoute,
   });
+  this.route("setupWizardPreinstalled", {
+    path: "/setup/preinstalled",
+    layoutTemplate: "setupWizardLayout",
+    controller: setupRoute,
+  });
   this.route("setupWizardLoginUser", {
     path: "/setup/user",
     layoutTemplate: "setupWizardLayout",
@@ -868,7 +1044,7 @@ Router.map(function () {
   this.route("setupWizardVerifyToken", {
     path: "/setup/token/:_token",
     layoutTemplate: "setupWizardLayout",
-    onBeforeAction: function () {
+    onBeforeAction() {
       this.state.set("redeemStatus", "in-progress");
       // For whatever reason, the RouteController is no longer available in the async callback
       // below, so we save a handle to the state object.

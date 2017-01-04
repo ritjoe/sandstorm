@@ -17,10 +17,10 @@
 // This file implements logic that we place in front of our main Meteor application,
 // including routing of requests to proxies and handling of static web publishing.
 
+import { inMeteor } from "/imports/server/async-helpers.js";
 const Url = Npm.require("url");
 const Fs = Npm.require("fs");
 const Dns = Npm.require("dns");
-const Promise = Npm.require("es6-promise").Promise;
 const Future = Npm.require("fibers/future");
 const Http = Npm.require("http");
 const Capnp = Npm.require("capnp");
@@ -36,6 +36,13 @@ const webPublishingHandlers = {};
 // Maps grain public IDs to Connect handlers.
 // TODO(perf): Garbage-collect this map?
 
+// TODO(perf): Implement a more general cache not just of web publishing handlers but of all sorts
+//   of hosts, in order to avoid database lookups to determine how to handle requests. Host types
+//   to distinguish between:
+//   - Grain hosts
+//   - Web publishing hosts
+//   - Standalone grain hosts
+
 const dnsCache = {};
 // Unfortunately, node's DNS library doesn't cache results, so we do our own caching.
 // Unfortunately, node's DNS library also dosen't give us TTLs. So, we'll cache for
@@ -48,22 +55,30 @@ function isSandstormShell(hostname) {
   return (hostname === HOSTNAME || (DDP_HOSTNAME && hostname === DDP_HOSTNAME));
 }
 
-const mime = Connect.static.mime;
+// We need to use connect. Let's make sure we're using the same version as Meteor's WebApp module
+// uses. Fortunately, they let us extract it.
+const connect = WebAppInternals.NpmModules.connect.module;
+
+const mime = connect.static.mime;
 
 function wwwHandlerForGrain(grainId) {
   return (request, response) => {
     let path = request.url;
 
-    // If a directory, open 'index.html'.
+    // Strip query.
+    path = path.split("?")[0];
+
+    // If a directory, open "index.html".
     if (path.slice(-1) === "/") {
       path = path + "index.html";
     }
 
-    // Strip leading '/'.
+    // Strip leading "/".
     if (path[0] === "/") path = path.slice(1);
 
-    // Strip query.
-    path = path.split("?")[0];
+    // URI-decode the rest. Note that this allows filenames to contain spaces and question marks.
+    const encoded = path;
+    path = decodeURIComponent(encoded);
 
     let type = mime.lookup(path);
     const charset = mime.charsets.lookup(type);
@@ -74,7 +89,7 @@ function wwwHandlerForGrain(grainId) {
       type = type + "; charset=utf-8";
     }
 
-    // TODO(perf): Automatically gzip text content? Use Express's 'compress' middleware for this?
+    // TODO(perf): Automatically gzip text content? Use Express's "compress" middleware for this?
     //   Note that nginx will also auto-compress things...
 
     response.setHeader("Content-Type", type);
@@ -102,7 +117,7 @@ function wwwHandlerForGrain(grainId) {
     const streamCap = new Capnp.Capability(stream, ByteStream);
 
     globalBackend.useGrain(grainId, (supervisor) => {
-      return supervisor.getWwwFileHack(path, streamCap).then((result) => {
+      const tryPath = (path) => supervisor.getWwwFileHack(path, streamCap).then((result) => {
         // jscs:disable disallowQuotedKeysInObjects
         const status = result.status;
         if (status === "file") {
@@ -116,6 +131,13 @@ function wwwHandlerForGrain(grainId) {
           });
           response.end("redirect: /" + path + "/");
         } else if (status === "notFound") {
+          if (path !== encoded) {
+            // Compatibility hack: Try getting the URL-encoded version of the path. We used to not
+            // URL-decode paths at all, hence the need for this fallback.
+            // TODO(apibump): Move this hack to the compat layer.
+            return tryPath(encoded);
+          }
+
           stream.sendingDirectResponse();
           response.writeHead(404, {
             "Content-Type": "text/plain",
@@ -132,6 +154,7 @@ function wwwHandlerForGrain(grainId) {
 
         streamCap.close();
       });
+      return tryPath(path);
     }).catch((err) => {
       console.error(err.stack);
       streamCap.close();
@@ -196,145 +219,191 @@ function serveSelfTest(req, res) {
   }
 }
 
-function serveStaticAsset(req, res) {
+function serveStaticAsset(req, res, hostId) {
   inMeteor(() => {
     if (req.method === "GET") {
-      // jscs:disable validateQuoteMarks
       const assetCspHeader = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
-      if (req.headers['if-none-match'] === 'permanent') {
+      if (req.headers["if-none-match"] === "permanent") {
         // Cache never invalidates since we use a new URL for every resource.
         res.writeHead(304, {
-          'Cache-Control': 'public, max-age=31536000',
-          'ETag': 'permanent',
+          "Cache-Control": "public, max-age=31536000",
+          "ETag": "permanent",
 
           // To be safe, send these again, although it shouldn't be necessary.
-          'Content-Security-Policy': assetCspHeader,
-          'Access-Control-Allow-Origin': '*',
-          'X-Content-Type-Options': 'nosniff',
+          "Content-Security-Policy": assetCspHeader,
+          "Access-Control-Allow-Origin": "*",
+          "X-Content-Type-Options": "nosniff",
         });
         res.end();
         return;
       }
 
-      const url = Url.parse(req.url);
-      const asset = globalDb.getStaticAsset(url.pathname.slice(1));
+      const url = Url.parse(req.url, true);
+      const pathname = url.pathname.slice(1);
+      let asset;
+      if (pathname.startsWith("identicon/")) {
+        const size = parseInt((url.query || {}).s);
+        asset = new Identicon(pathname.slice("identicon/".length), size).asAsset();
+      } else if (pathname.indexOf("/") == -1) {
+        asset = globalDb.getStaticAsset(pathname);
+      }
 
       if (asset) {
         const headers = {
-          'Content-Type': asset.mimeType,
-          'Content-Length': asset.content.length,
+          "Content-Type": asset.mimeType,
+          "Content-Length": asset.content.length,
 
           // Assets can be cached forever because each one has a unique ID.
-          'Cache-Control': 'public, max-age=31536000',
+          "Cache-Control": "public, max-age=31536000",
 
           // Since different resources get different URLs, we can use a static etag.
-          'ETag': 'permanent',
+          "ETag": "permanent",
 
           // Set strict Content-Security-Policy to prevent static assets from executing any script
           // or doing basically anything when browsed to directly. The static assets host is not
           // intended to serve HTML. Mostly, it serves images and javascript -- note that setting
           // the CSP header on Javascript files does not prevent other hosts from voluntarily
           // specifying these scripts in <script> tags.
-          'Content-Security-Policy': assetCspHeader,
+          "Content-Security-Policy": assetCspHeader,
 
           // Allow any host to fetch these assets. This is safe since requests to this host are
           // totally side-effect-free and the asset ID acts as a capability to prevent loading
           // assets you're not supposed to know about.
-          'Access-Control-Allow-Origin': '*',
+          "Access-Control-Allow-Origin": "*",
 
           // Extra protection against content type trickery.
-          'X-Content-Type-Options': 'nosniff',
+          "X-Content-Type-Options": "nosniff",
         };
 
         if (asset.encoding) {
-          headers['Content-Encoding'] = asset.encoding;
+          headers["Content-Encoding"] = asset.encoding;
         }
 
         res.writeHead(200, headers);
         res.end(asset.content);
       } else {
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
-        res.end('not found');
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("not found");
       }
-    } else if (req.method === 'POST') {
-      res.setHeader('Access-Control-Allow-Origin', '*');
+    } else if (req.method === "POST") {
+      res.setHeader("Access-Control-Allow-Origin", "*");
 
       const url = Url.parse(req.url);
       const purpose = globalDb.fulfillAssetUpload(url.pathname.slice(1));
+
+      // Sanity check the purpose of this upload token.
       if (!purpose) {
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
-        res.end('Upload token not found or expired.');
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("Upload token not found or expired.");
+        return;
+      } else if (purpose.profilePicture) {
+        const userId = purpose.profilePicture.userId;
+        const identityId = purpose.profilePicture.identityId;
+        check(userId, String);
+        check(identityId, String);
+      } else if (purpose.loginLogo) {
+        // no additional fields for loginLogo
+      } else {
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end("Found invalid purpose for upload");
         return;
       }
-
-      const userId = purpose.profilePicture.userId;
-      const identityId = purpose.profilePicture.identityId;
-      check(userId, String);
-      check(identityId, String);
 
       const buffers = [];
       let totalSize = 0;
       const done = new Future();
-      req.on('data', (buf) => {
+      req.on("data", (buf) => {
         totalSize += buf.length;
         if (totalSize <= (64 * 1024)) {
           buffers.push(buf);
         }
       });
-      req.on('end', done.return.bind(done));
-      req.on('error', done.throw.bind(done));
+      req.on("end", done.return.bind(done));
+      req.on("error", done.throw.bind(done));
       done.wait();
 
       if (totalSize > (64 * 1024)) {
         // TODO(soon): Resize the image ourselves.
-        res.writeHead(400, { 'Content-Type': 'text/plain' });
-        res.end('Picture too large; please use an image under 64 KiB.');
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("Picture too large; please use an image under 64 KiB.");
         return;
       }
 
       const content = Buffer.concat(buffers);
       let type;
       if (checkMagic(content, PNG_MAGIC)) {
-        type = 'image/png';
+        type = "image/png";
       } else if (checkMagic(content, JPEG_MAGIC)) {
-        type = 'image/jpeg';
+        type = "image/jpeg";
       } else {
-        res.writeHead(400, { 'Content-Type': 'text/plain' });
-        res.end('Image must be PNG or JPEG.');
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("Image must be PNG or JPEG.");
         return;
       }
 
       const assetId = globalDb.addStaticAsset({ mimeType: type }, content);
-      const old = Meteor.users.findAndModify({
-        query: { '_id': identityId },
-        update: { $set: { 'profile.picture': assetId } },
-        fields: { 'profile.picture': 1 },
-      });
 
-      if (old && old.profile && old.profile.picture) {
-        globalDb.unrefStaticAsset(old.profile.picture);
+      if (purpose.profilePicture) {
+        const identityId = purpose.profilePicture.identityId;
+        const result = Meteor.users.findAndModify({
+          query: { _id: identityId },
+          update: { $set: { "profile.picture": assetId } },
+          fields: { "profile.picture": 1 },
+        });
+
+        if (result.ok) {
+          const old = result.value;
+          if (old && old.profile && old.profile.picture) {
+            globalDb.unrefStaticAsset(old.profile.picture);
+          }
+        } else {
+          res.writeHead(500, { "Content-Type": "text/plain" });
+          res.end("Couldn't update profile picture.");
+          return;
+        }
+      } else if (purpose.loginLogo) {
+        const result = globalDb.collections.settings.findAndModify({
+          query: { _id: "whitelabelCustomLogoAssetId" },
+          update: {
+            $setOnInsert: { _id: "whitelabelCustomLogoAssetId" },
+            $set: { value: assetId },
+          },
+          upsert: true,
+          fields: { value: 1 },
+        });
+
+        if (result.ok) {
+          const old = result.value;
+          if (old && old.value) {
+            globalDb.unrefStaticAsset(old.value);
+          }
+        } else {
+          res.writeHead(500, { "Content-Type": "text/plain" });
+          res.end("Couldn't update login logo.");
+          return;
+        }
       }
 
       res.writeHead(204, {});
       res.end();
-    } else if (req.method === 'OPTIONS') {
-      const requestedHeaders = req.headers['access-control-request-headers'];
+    } else if (req.method === "OPTIONS") {
+      const requestedHeaders = req.headers["access-control-request-headers"];
       if (requestedHeaders) {
-        res.setHeader('Access-Control-Allow-Headers', requestedHeaders);
+        res.setHeader("Access-Control-Allow-Headers", requestedHeaders);
       }
 
       res.writeHead(204, {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
-        'Access-Control-Max-Age': '3600',
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+        "Access-Control-Max-Age": "3600",
       });
       res.end();
     } else {
-      res.writeHead(405, 'Method Not Allowed', {
-        'Allow': 'GET, POST, OPTIONS',
-        'Content-Type': 'text/plain',
+      res.writeHead(405, "Method Not Allowed", {
+        "Allow": "GET, POST, OPTIONS",
+        "Content-Type": "text/plain",
       });
-      res.end('405 Method Not Allowed: ' + req.method);
+      res.end("405 Method Not Allowed: " + req.method);
     }
   }).catch((err) => {
     writeErrorResponse(res, err);
@@ -348,7 +417,7 @@ const canonicalizeShellOrWildcardUrl = (hostname, url) => {
 
   // Retain the protocol & port from ROOT_URL but use the inbound
   // hostname.
-  targetUrl.host = hostname + ':' + targetUrl.port;
+  targetUrl.host = hostname + ":" + targetUrl.port;
 
   // The following allows to avoid decoding + re-encoding query
   // string parameters, if provided.
@@ -361,7 +430,7 @@ const handleNonMeteorRequest = (req, res, next, redirectIfInWildcard) => {
   // prefer to redirect to the canonical url for that request.  If false, we will respond to the
   // request directly.
 
-  const hostname = req.headers.host.split(':')[0];
+  const hostname = req.headers.host.split(":")[0];
 
   let publicIdPromise;
   // See if the request was for a host in the wildcard.
@@ -369,12 +438,12 @@ const handleNonMeteorRequest = (req, res, next, redirectIfInWildcard) => {
   if (id) {
     // Match!
     if (redirectIfInWildcard) {
-      res.writeHead(302, { 'Location': canonicalizeShellOrWildcardUrl(hostname, req.url) });
+      res.writeHead(302, { "Location": canonicalizeShellOrWildcardUrl(hostname, req.url) });
       res.end();
       return;
     }
 
-    if (id === 'static') {
+    if (id === "static") {
       // Static assets domain.
       serveStaticAsset(req, res);
       return;
@@ -411,7 +480,7 @@ const handleNonMeteorRequest = (req, res, next, redirectIfInWildcard) => {
           return inMeteor(() => {
             const grain = Grains.findOne({ publicId: publicId }, { fields: { _id: 1 } });
             if (!grain) {
-              throw new Meteor.Error(404, 'No such grain for public ID: ' + publicId);
+              throw new Meteor.Error(404, "No such grain for public ID: " + publicId);
             }
 
             const grainId = grain._id;
@@ -445,7 +514,7 @@ const handleNonMeteorRequestDirectly = (req, res, next) => {
 //
 // Alternate ports are bound to FD #5 and higher.
 const getNumberOfAlternatePorts = function () {
-  const numPorts = process.env.PORT.split(',').length;
+  const numPorts = process.env.PORT.split(",").length;
   const numAlternatePorts = numPorts - 1;
   return numAlternatePorts;
 };
@@ -453,18 +522,19 @@ const getNumberOfAlternatePorts = function () {
 const handleNonMainPortRequest = (req, res, next) => {
   try {
     if (!req.headers.host) {
-      res.writeHead(400, { 'Content-Type': 'text/plain' });
-      res.end('Missing Host header');
+      res.writeHead(400, { "Content-Type": "text/plain" });
+      res.end("Missing Host header");
       return;
     }
 
     // If this request is intended for the shell, redirect to the canonical shell URL.
-    const hostname = req.headers.host.split(':')[0];
+    const hostname = req.headers.host.split(":")[0];
     if (isSandstormShell(hostname)) {
-      res.writeHead(302, { 'Location': canonicalizeShellOrWildcardUrl(hostname, req.url) });
+      res.writeHead(302, { "Location": canonicalizeShellOrWildcardUrl(hostname, req.url) });
       res.end();
       return;
     }
+    // TODO(someday): check for standalone hosts and do something reasonable
 
     handleNonMeteorRequest(req, res, next, true);
   } catch (e) {
@@ -488,7 +558,7 @@ Meteor.startup(() => {
   const meteorRequestListeners = WebApp.httpServer.listeners("request");
 
   // Construct the middleware chain for requests to non-DDP, non-shell hosts.
-  const nonMeteorRequestHandler = Connect();
+  const nonMeteorRequestHandler = connect();
   // BlackrockPayments is only defined in the Blackrock build of Sandstorm.
   if (global.BlackrockPayments) { // Have to check with global, because it could be undefined.
     nonMeteorRequestHandler.use(BlackrockPayments.makeConnectHandler(globalDb));
@@ -498,42 +568,77 @@ Meteor.startup(() => {
 
   WebApp.httpServer.removeAllListeners("request");
   WebApp.httpServer.on("request", (req, res) => {
-    try {
+    Promise.resolve(undefined).then(() => {
       if (!req.headers.host) {
-        res.writeHead(400, { 'Content-Type': 'text/plain' });
-        res.end('Missing Host header');
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("Missing Host header");
         return;
       }
 
-      const hostname = req.headers.host.split(":")[0];
+      const hostname = req.headers.host.split(":")[0]; // strip port if it exists
       if (isSandstormShell(hostname)) {
+        if (req.url.startsWith("/_oauth/")) {
+          // Intercept oauth callbacks on the main host to check if the user was actually logging
+          // into a standalone host, in which case we need to redirect to that host instead.
+          const parsedUrl = Url.parse(req.url, true);
+          if (parsedUrl.query && parsedUrl.query.state) {
+            const rawState = new Buffer(parsedUrl.query.state, "base64");
+            const state = JSON.parse(rawState.toString());
+            if (state.redirectUrl) {
+              const parsedRedirect = Url.parse(state.redirectUrl);
+              const redirectHostname = parsedRedirect.hostname;
+              if (redirectHostname !== HOSTNAME) {
+                return inMeteor(function () {
+                  if (globalDb.hostIsStandalone(redirectHostname)) {
+                    res.writeHead(302, { "Location": parsedRedirect.protocol + "//" +
+                      parsedRedirect.host + req.url, });
+                    res.end();
+                    return;
+                  } else {
+                    throw new Meteor.Error(400, "redirectUrl in OAuth was for an unknown host: " +
+                      state.redirectUrl);
+                  }
+                });
+              }
+            }
+          }
+        }
         // If destined for the DDP host or the main host, pass on to Meteor
         for (let i = 0; i < meteorRequestListeners.length; i++) {
           meteorRequestListeners[i](req, res);
         }
       } else {
-        // Otherwise, dispatch to our own middleware proxy chain.
-        nonMeteorRequestHandler(req, res);
-        // Adjust timeouts on proxied requests to allow apps to long-poll if needed.
-        WebApp._timeoutAdjustmentRequestCallback(req, res);
+        return inMeteor(function () {
+          if (globalDb.hostIsStandalone(hostname)) {
+            // If it's a standalone host, also pass on to meteor
+            for (let i = 0; i < meteorRequestListeners.length; i++) {
+              meteorRequestListeners[i](req, res);
+            }
+          } else {
+            // Otherwise, dispatch to our own middleware proxy chain.
+            nonMeteorRequestHandler(req, res);
+            // Adjust timeouts on proxied requests to allow apps to long-poll if needed.
+            WebApp._timeoutAdjustmentRequestCallback(req, res);
+          }
+        });
       }
-    } catch (e) {
+    }).catch(function (e) {
       // This should never be reached, because all the request handlers should be catching
       // exceptions, but you can never be too careful in a top-level request handler.
-      console.err("Unhandled exception in request handler:", e.stack);
+      console.error("Unhandled exception in request handler:", e.stack);
       res.writeHead(500, { "Content-Type": "text/plain" });
       res.end("Unhandled exception: " + e.stack);
-    }
+    });
   });
 
-  const meteorUpgradeListeners = WebApp.httpServer.listeners('upgrade');
+  const meteorUpgradeListeners = WebApp.httpServer.listeners("upgrade");
   WebApp.httpServer.removeAllListeners("upgrade");
 
   WebApp.httpServer.on("upgrade", (req, socket, head) => {
     Promise.resolve(undefined).then(() => {
       if (!req.headers.host) {
-        throw new Meteor.Error(400, 'Missing Host header');
-      } else if (isSandstormShell(req.headers.host.split(':')[0])) {
+        throw new Meteor.Error(400, "Missing Host header");
+      } else if (isSandstormShell(req.headers.host.split(":")[0])) {
         // Go on to Meteor.
         for (let ii = 0; ii < meteorUpgradeListeners.length; ++ii) {
           meteorUpgradeListeners[ii](req, socket, head);
@@ -541,17 +646,30 @@ Meteor.startup(() => {
 
         return true;
       } else {
-        const id = matchWildcardHost(req.headers.host);
-        if (id) {
-          return tryProxyUpgrade(id, req, socket, head);
-        } else {
-          return false;
-        }
+        return inMeteor(function () {
+          // TODO(someday): This is slightly sad that some requests will now need a Meteor fiber
+          // If we disallow standalone domains from being in the wildcard host, then we can move
+          // this check to the bottom.
+          if (globalDb.hostIsStandalone(req.headers.host.split(":")[0])) {
+            for (let ii = 0; ii < meteorUpgradeListeners.length; ++ii) {
+              meteorUpgradeListeners[ii](req, socket, head);
+            }
+
+            return true;
+          } else {
+            const id = matchWildcardHost(req.headers.host);
+            if (id) {
+              return tryProxyUpgrade(id, req, socket, head);
+            } else {
+              return false;
+            }
+          }
+        });
       }
     }).then((handled) => {
       if (!handled) socket.destroy();
     }).catch((err) => {
-      console.error('WebSocket event handler failed:', err.stack);
+      console.error("WebSocket event handler failed:", err.stack);
       socket.destroy();
     });
   });
@@ -560,17 +678,17 @@ Meteor.startup(() => {
 });
 
 const errorTxtMapping = {};
-errorTxtMapping[Dns.NOTFOUND] = '<p>' +
-    'If you were trying to configure static publishing for a blog or website, powered ' +
-    'by a Sandstorm app hosted at this server, you either have not added DNS TXT records ' +
-    'correctly, or the DNS cache has not updated yet (may take a while, like 5 minutes to one ' +
-    'hour).</p>';
+errorTxtMapping[Dns.NOTFOUND] = "<p>" +
+    "If you were trying to configure static publishing for a blog or website, powered " +
+    "by a Sandstorm app hosted at this server, you either have not added DNS TXT records " +
+    "correctly, or the DNS cache has not updated yet (may take a while, like 5 minutes to one " +
+    "hour).</p>";
 errorTxtMapping[Dns.NODATA] = errorTxtMapping[Dns.NOTFOUND];
-errorTxtMapping[Dns.TIMEOUT] = '<p>' +
-    'The DNS query has timed out, which may be a sign of poorly configured DNS on the server.</p>';
-errorTxtMapping[Dns.CONNREFUSED] = '<p>' +
-    'The DNS server refused the connection, which means either your DNS server is down/unreachable, ' +
-    'or the server has misconfigured their DNS.</p>';
+errorTxtMapping[Dns.TIMEOUT] = "<p>" +
+    "The DNS query has timed out, which may be a sign of poorly configured DNS on the server.</p>";
+errorTxtMapping[Dns.CONNREFUSED] = "<p>" +
+    "The DNS server refused the connection, which means either your DNS server is down/unreachable, " +
+    "or the server has misconfigured their DNS.</p>";
 
 function lookupPublicIdFromDns(hostname) {
   // Given a hostname, determine its public ID.
@@ -592,36 +710,38 @@ function lookupPublicIdFromDns(hostname) {
   }
 
   return new Promise((resolve, reject) => {
-    Dns.resolveTxt('sandstorm-www.' + hostname, (err, records) => {
+    Dns.resolveTxt("sandstorm-www." + hostname, (err, records) => {
       if (err) {
-        const errorMsg = errorTxtMapping[err.code] || '';
+        const errorMsg = errorTxtMapping[err.code] || "";
         const error = new Error(
           'Error looking up DNS TXT records for host "' + hostname + '": ' + err.message);
         error.htmlMessage =
           '<style type="text/css">h2, h3, p { max-width: 600px; }</style>' +
-          '<h2>Sandstorm static publishing needs further configuration (or wrong URL)</h2>' +
+          "<h2>Sandstorm static publishing needs further configuration (or wrong URL)</h2>" +
           errorMsg +
-          '<p>To visit this Sandstorm server\'s main interface, go to: <a href=\'' + process.env.ROOT_URL + '\'>' +
-          process.env.ROOT_URL + '</a></p>' +
-          '<h3>DNS details</h3>' +
-          '<p>Error looking up DNS TXT records for host "' + hostname + '": ' + err.message + '</p>' +
-          '<p>If you have the <tt>dig</tt> tool, you can run this command to learn more:</p>' +
-          '<p><tt>dig TXT sandstorm-www.' + hostname + '</tt></p>' +
-          '<h3>Changing the server URL, or troubleshooting OAuth login</h3>' +
-          '<p>If you are the server admin and want to use this address as the main interface, ' +
-          'edit /opt/sandstorm/sandstorm.conf, modify the BASE_URL setting, and restart ' +
-          'Sandstorm.</p>' +
-          '<p>If you got here after trying to log in via OAuth (e.g. through GitHub or Google), ' +
-          'the problem is probably that the OAuth callback URL was set wrong. You need to ' +
-          'update it through the respective login provider\'s management console. The ' +
-          'easiest way to do that is to run <tt>sudo sandstorm admin-token</tt>, then ' +
-          'reconfigure the OAuth provider.</p>';
-        error.httpErrorCode = (_.contains(['ENOTFOUND', 'ENODATA'], err.code)) ? 404 : 500;
+          "<p>To visit this Sandstorm server's main interface, go to: <a href='" + process.env.ROOT_URL + "'>" +
+          process.env.ROOT_URL + "</a></p>" +
+          "<h3>DNS details</h3>" +
+          '<p>Error looking up DNS TXT records for host "' + hostname + '": ' + err.message + "</p>" +
+          "<p>If you have the <tt>dig</tt> tool, you can run this command to learn more:</p>" +
+          "<p><tt>dig TXT sandstorm-www." + hostname + "</tt></p>" +
+          "<h3>Changing the server URL, or troubleshooting OAuth login</h3>" +
+          "<p>If you are the server admin and want to use this address as the main interface, " +
+          "edit /opt/sandstorm/sandstorm.conf, modify the BASE_URL setting, and restart " +
+          "Sandstorm.</p>" +
+          "<p>If you got here after trying to log in via OAuth (e.g. through GitHub or Google), " +
+          "the problem is probably that the OAuth callback URL was set wrong. You need to " +
+          "update it through the respective login provider's management console. The " +
+          "easiest way to do that is to run <tt>sudo sandstorm admin-token</tt>, then " +
+          "reconfigure the OAuth provider.</p>";
+        error.httpErrorCode = (_.contains(["ENOTFOUND", "ENODATA"], err.code)) ? 404 : 500;
         reject(error);
       } else if (records.length !== 1) {
         reject(new Error('Host "sandstorm-www.' + hostname + '" must have exactly one TXT record.'));
       } else {
-        const result = records[0];
+        // Under node 0.12+, `records` is an array-of-arrays. Each sub-array contains "chunks" of a
+        // record, which should be joined.
+        const result = records[0].join("");
         dnsCache[hostname] = { value: result, expiration: Date.now() + DNS_CACHE_TTL };
         resolve(result);
       }

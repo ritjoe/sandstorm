@@ -14,6 +14,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { allowDemo } from "/imports/demo.js";
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 if (Mongo.Collection.prototype.aggregate) {
@@ -163,6 +165,16 @@ computeStats = function (since) {
 };
 
 function recordStats() {
+  const postStats = function (record) {
+    HTTP.post("https://alpha-api.sandstorm.io/data", {
+      data: record,
+      headers: {
+        Authorization: "Bearer aT-mGyNwsgwZBbZvd5FWr0Ma79O9IehI4NiEO94y_oR",
+        "Content-Type": "application/json",
+      },
+    });
+  };
+
   const now = new Date();
 
   const planStats = _.countBy(
@@ -180,30 +192,31 @@ function recordStats() {
     plans: planStats,
   };
   record.computeTime = Date.now() - now;
+  if (global.BlackrockPayments && global.BlackrockPayments.getTotalCharges) {
+    // This only exists under Blackrock
+    record.totalCharges = global.BlackrockPayments.getTotalCharges();
+  }
 
   ActivityStats.insert(record);
   const age = ActivityStats.find().count();
-  if (age > 3) {
+  // The stats page which the user agreed we can send actually displays the whole history
+  // of the server, but we're only sending stats from the last day. Let's also throw in the
+  // length of said history. This is still strictly less information than what the user said
+  // we're allowed to send.
+  record.serverAge = age;
+
+  if (globalDb.isFeatureKeyOptedIntoStats()) {
+    record.customerId = globalDb.currentFeatureKey().customer.id;
+    postStats(record);
+  } else if (age > 3) {
     const reportSetting = Settings.findOne({ _id: "reportStats" });
+
     if (!reportSetting) {
       // Setting not set yet, send out notifications and set it to false
-      globalDb.sendAdminNotification("You can help Sandstorm by sending us some anonymous " +
-        "usage stats. Click here for more info.", "/admin/stats");
+      globalDb.sendAdminNotification("reportStats", "/admin/stats");
       Settings.insert({ _id: "reportStats", value: "unset" });
     } else if (reportSetting.value === true) {
-      // The stats page which the user agreed we can send actually displays the whole history
-      // of the server, but we're only sending stats from the last day. Let's also throw in the
-      // length of said history. This is still strictly less information than what the user said
-      // we're allowed to send.
-      record.serverAge = age;
-
-      HTTP.post("https://alpha-api.sandstorm.io/data", {
-        data: record,
-        headers: {
-          Authorization: "Bearer aT-mGyNwsgwZBbZvd5FWr0Ma79O9IehI4NiEO94y_oR",
-          "Content-Type": "application/json",
-        },
-      });
+      postStats(record);
     }
   }
 }

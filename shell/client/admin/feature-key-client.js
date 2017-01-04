@@ -20,8 +20,17 @@ Template.newAdminFeatureKey.helpers({
   },
 });
 
+function hexString(bytes) {
+  const DIGITS = "0123456789abcdef";
+
+  // Watch out: Uint8Array.map() constructs a new Uint8Arary.
+  return Array.prototype.map
+      .call(bytes, byte => DIGITS[Math.floor(byte / 16)] + DIGITS[byte % 16])
+      .join("");
+}
+
 Template.adminFeatureKeyDetails.helpers({
-  computeValidity: function (featureKey) {
+  computeValidity(featureKey) {
     const nowSec = Date.now() / 1000;
     const expires = parseInt(featureKey.expires);
     if (expires >= nowSec) {
@@ -45,7 +54,15 @@ Template.adminFeatureKeyDetails.helpers({
     }
   },
 
-  renderDateString: function (stringSecondsSinceEpoch) {
+  renderUserLimitString(userLimit) {
+    if (userLimit == 4294967295) {
+      return "Unlimited users";
+    } else {
+      return `${userLimit} users`;
+    }
+  },
+
+  renderDateString(stringSecondsSinceEpoch) {
     if (stringSecondsSinceEpoch === "18446744073709551615") { // UINT64_MAX means "never expires"
       return "Never";
     }
@@ -58,7 +75,22 @@ Template.adminFeatureKeyDetails.helpers({
 
     return MONTHS[d.getMonth()] + " " + d.getDate() + ", " + d.getFullYear();
   },
+
+  keySecret(featureKey) {
+    return hexString(featureKey.secret);
+  },
 });
+
+// A properly-structured-but-signed-by-an-invalid-signer key to serve as an example in the input
+// so when people see the formatted copyable feature key in the Sandstorm for Work dashboard,
+// they will recognize the similar shape and ascii armor and hopefully connect to copy/paste it
+// more easily.
+const PLACEHOLDER_KEY = `--------------------- BEGIN SANDSTORM FEATURE KEY ----------------------
+6tNStoksTdIeEUogIeE6KcF/gVFGrE8QKISLX0gy/SkPmnwGDh0M8fofCxPouY6DTgcqa5Zb
+UPu9TJHMG0BiCRATUAMCD0Tg9lcPRG0eWB//////AREFolEMAQP/V457RSOWN5kBYLA9/2nC
+fwkPemD3mf9sCbF+QdeTQgARCWIRDXIREYL/QmlnIHNwZW4AB2Rlcv9EYXZlIERldgAfIFVz
+ZXL/dGVzdEB6YXIBdm94Lm9yZwA=
+---------------------- END SANDSTORM FEATURE KEY -----------------------`;
 
 Template.featureKeyUploadForm.onCreated(function () {
   this.error = new ReactiveVar(undefined);
@@ -74,6 +106,12 @@ Template.featureKeyUploadForm.events({
 
     const instance = Template.instance();
     const text = instance.text.get();
+
+    if (text.lastIndexOf(PLACEHOLDER_KEY) !== -1) {
+      instance.error.set("The example key is not actually a valid key. ☺");
+      return;
+    }
+
     Meteor.call("submitFeatureKey", token, text, (err) => {
       if (err) {
         instance.error.set(err.message);
@@ -112,8 +150,12 @@ Template.featureKeyUploadForm.events({
 });
 
 Template.featureKeyUploadForm.helpers({
-  currentError: function () {
+  currentError() {
     return Template.instance().error.get();
+  },
+
+  placeholderKey() {
+    return PLACEHOLDER_KEY;
   },
 
   text() {
@@ -127,6 +169,7 @@ Template.featureKeyUploadForm.helpers({
 
 Template.adminFeatureKeyModifyForm.onCreated(function () {
   this.showForm = new ReactiveVar(undefined);
+  this.renewInFlight = new ReactiveVar(false);
 });
 
 Template.adminFeatureKeyModifyForm.helpers({
@@ -149,17 +192,43 @@ Template.adminFeatureKeyModifyForm.helpers({
       instance.showForm.set(undefined);
     };
   },
+
+  keySecret() {
+    return hexString(globalDb.currentFeatureKey().secret);
+  },
+
+  renewalProblem() {
+    return globalDb.currentFeatureKey().renewalProblem;
+  },
+
+  renewInFlight() {
+    return Template.instance().renewInFlight.get();
+  },
 });
 
 Template.adminFeatureKeyModifyForm.events({
-  "submit .feature-key-modify-form"(evt) {
-    evt.preventDefault();
-    evt.stopPropagation();
+  "click button.feature-key-upload-button"(evt) {
     Template.instance().showForm.set("update");
   },
 
   "click button.feature-key-delete-button"(evt) {
     Template.instance().showForm.set("delete");
+  },
+
+  "click .feature-key-renewal-problem button.retry"(evt) {
+    const instance = Template.instance();
+    const state = Iron.controller().state;
+    const token = state.get("token");
+    const renewInFlight = instance.renewInFlight;
+    renewInFlight.set(true);
+    Meteor.call("renewFeatureKey", token, (err) => {
+      renewInFlight.set(false);
+      if (err) {
+        // Note: Renewal failures aren't reported this way. If we get here there was a bug.
+        console.error(err);
+        alert(err.message);
+      }
+    });
   },
 });
 

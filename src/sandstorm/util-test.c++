@@ -73,6 +73,38 @@ KJ_TEST("base64 encoding/decoding") {
   }
 }
 
+KJ_TEST("percent encoding/decoding") {
+  KJ_EXPECT(percentEncode("foo") == "foo");
+  KJ_EXPECT(percentEncode("foo bar") == "foo%20bar");
+  KJ_EXPECT(percentEncode("\xab\xba") == "%ab%ba");
+  KJ_EXPECT(percentEncode(kj::StringPtr("foo\0bar", 7)) == "foo%00bar");
+
+  KJ_EXPECT(kj::str(percentDecode("foo%20bar").asChars()) == "foo bar");
+  KJ_EXPECT(kj::str(percentDecode("%ab%BA").asChars()) == "\xab\xba");
+}
+
+KJ_TEST("HeaderWhitelist") {
+  const char* WHITELIST[] = {
+    "bar-baz",
+    "corge",
+    "foo-*",
+    "grault",
+    "qux-*",
+  };
+
+  HeaderWhitelist whitelist((kj::ArrayPtr<const char*>(WHITELIST)));
+
+  KJ_ASSERT(whitelist.matches("bar-baz"));
+  KJ_ASSERT(whitelist.matches("bar-BAZ"));
+  KJ_ASSERT(!whitelist.matches("bar-qux"));
+  KJ_ASSERT(whitelist.matches("foo-abcd"));
+  KJ_ASSERT(whitelist.matches("grault"));
+  KJ_ASSERT(whitelist.matches("Grault"));
+  KJ_ASSERT(!whitelist.matches("grault-abcd"));
+  KJ_ASSERT(whitelist.matches("QUX-abcd"));
+  KJ_ASSERT(!whitelist.matches("quxqux"));
+}
+
 struct Pipe {
   kj::AutoCloseFd readEnd;
   kj::AutoCloseFd writeEnd;

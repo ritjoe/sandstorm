@@ -7,16 +7,18 @@
     <div class="grain-container {{#if active}}active-grain{{else}}inactive-grain{{/if}}">
     {{#if error}}
       {{#if inMyTrash}}
-        {{> grainInMyTrash}}
+        {{> grainInMyTrash . }}
       {{else}}
         {{#if inOwnersTrash}}
-          {{> grainInOwnersTrash}}
+          {{> grainInOwnersTrash ""}}
+        {{else}}{{#if grainOwnerSuspended}}
+          {{> grainOwnerSuspended ""}}
         {{else}}
           {{#if unauthorized}}
             {{#if token}}
-              {{> revokedShareLink}}
+              {{> revokedShareLink ""}}
             {{else}}
-              {{> requestAccess}}
+              {{> requestAccess . }}
             {{/if}}
           {{else}}
             {{#if notFound}}
@@ -27,15 +29,20 @@
                <pre>{{error}}</pre>
             {{/if}}
           {{/if}}
-        {{/if}}
+        {{/if}}{{/if}}
       {{/if}}
     {{else}}
     {{#if appOrigin}}
-      {{!-- Selenium requires iframes to have an id in order to select them. id="grain-frame" is only
+      {{!-- Selenium requires iframes to have an id in order to select them. `id` is only
             used for testing purposes. --}}
-      <iframe data-grainid="{{grainId}}" id="grain-frame" class="grain-frame" src="{{appOrigin}}/_sandstorm-init?sessionid={{sessionId}}&path={{originalPath}}"></iframe>
+      <iframe data-grainid="{{grainId}}" id="{{idPrefix}}grain-frame-{{grainId}}" class="grain-frame" src="{{appOrigin}}/_sandstorm-init?sessionid={{sessionId}}&path={{originalPath}}"></iframe>
+      {{#with signinOverlay}}
+        {{#modalDialogWithBackdrop class="signin" onDismiss=closeSignInOverlay}}
+          {{> loginButtonsDialog label=label accountsUi=globalAccountsUi}}
+        {{/modalDialogWithBackdrop}}
+      {{/with}}
       {{#if hasNotLoaded}}
-        {{> _grainSpinner}}
+        {{> _grainSpinner ""}}
       {{/if}}
     {{else}}
     {{#if interstitial.chooseIdentity}}
@@ -47,7 +54,7 @@
         {{/if}}
       </div>
     {{else}}
-      {{> _grainSpinner}}
+      {{> _grainSpinner ""}}
     {{/if}}
     {{/if}}
     {{/if}}
@@ -68,6 +75,14 @@
   <div class="grain-interstitial">
     <p>
       You can no longer access this grain because its owner has moved it to the trash.
+    </p>
+  </div>
+</template>
+
+<template name="grainOwnerSuspended">
+  <div class="grain-interstitial">
+    <p>
+      You can no longer access this grain because its owner's account has been suspended.
     </p>
   </div>
 </template>
@@ -149,8 +164,38 @@
   <button class="grain-button" title="Show Debug Log" id="openDebugLog">Log</button>
 </template>
 <template name="grainBackupButton">
-  <button class="grain-button {{#if isLoading}}loading{{/if}}" title="Download Backup" id="backupGrain" disabled="{{#if isLoading}}true{{/if}}">Backup</button>
+  <button class="grain-button" title="Download Backup" id="backupGrain">Backup</button>
 </template>
+
+<template name="grainBackupPopup">
+  <h4>Download Backup</h4>
+  {{#if state.showWarning }}
+    <p class="warning-intro">
+      Warning! Restoring this backup might not work how you expect it to.
+    </p>
+    <p class="warning-body">
+      {{ state.showWarning }}
+    </p>
+  {{/if}}
+  {{#if state.processing}}
+    <p> Preparing backup... </p>
+  {{/if}}
+  {{#if state.error}}
+    <p class="error">Error: {{ state.error }}</p>
+  {{/if}}
+
+  <div class="button-row">
+    <button name="cancel" title="cancel">Cancel</button>
+    {{#if state.processing}}
+      <div class="spinner"></div>
+    {{/if}}
+
+    {{#if state.showWarning}}
+      <button name="confirm" title="download backup">Download backup</button>
+    {{/if}}
+  </div>
+</template>
+
 <template name="grainRestartButton">
   <button class="grain-button" title="Restart App" id="restartGrain">Restart</button>
 </template>
@@ -219,19 +264,25 @@
 <template name="whoHasAccess">
    <img src="/people.svg">
 </template>
+
 <template name="whoHasAccessPopup">
   <h4 class="who-has-access">Who has access</h4>
+  {{#if isReady}}
   <div class="tables-container">
     <h5>People</h5>
-    {{#if transitiveShares.empty}}
+    {{#if transitiveShares.identityOwnedShares.empty}}
       {{#if existingShareTokens}}
         <p>No logged-in users have visited your links yet.</p>
       {{else}}
-        <p>You have granted access to nobody.</p>
+        {{#if transitiveShares.grainOwnedShares.empty}}
+          <p>You have granted access to nobody.</p>
+        {{else}}
+          <p>No logged-in users have visited your links yet.</p>
+        {{/if}}
       {{/if}}
     {{else}}
       <table class="people">
-        {{#each transitiveShares}}
+        {{#each transitiveShares.identityOwnedShares}}
           <tr>
             <td> {{displayName recipient}} </td>
             <td> added by
@@ -252,6 +303,31 @@
         {{/each}}
       </table>
     {{/if}}
+    {{#unless transitiveShares.grainOwnedShares.empty}}
+      <h5>Grains</h5>
+      <table class="grains">
+        {{#each transitiveShares.grainOwnedShares}}
+          <tr>
+            <td>{{grainTitle recipient}}</td>
+            <td> added by
+              <ul>
+                {{#each dedupedShares}}
+                  <li>
+                    {{displayName identityId}}
+                    {{#if isCurrentIdentity identityId}}
+                      <button class="revoke-access" title="Revoke" data-recipient="{{../recipient}}">
+                        Revoke
+                      </button>
+                    {{/if}}
+                  </li>
+                {{/each}}
+              </ul>
+            </td>
+          </tr>
+        {{/each}}
+      </table>
+    {{/unless}}
+
     {{#if existingShareTokens}}
       <h5>Sharing Links</h5>
       <table class="shared-links">
@@ -291,6 +367,9 @@
       </table>
       {{/if}}
    </div>
+   {{else}}
+   <img class="spinner" src="/spinner_96.gif" alt="loading">
+   {{/if}}
 </template>
 
 <template name="selectRole">
@@ -458,10 +537,17 @@
 </template>
 <template name="grainPowerboxOfferPopup">
   <h4>Powerbox Offer</h4>
+  {{#if state.webkey}}
   <div>
-    <a class="copy-me" href="{{powerboxOfferUrl}}" id="powerbox-offer-url">{{powerboxOfferUrl}}</a>
+    <a class="copy-me" href="{{state.webkey}}" id="powerbox-offer-url">{{state.webkey}}</a>
     <button class="dismiss">Dismiss</button>
   </div>
+  {{/if}}
+  {{#if state.error}}
+  <div>
+     Error: {{state.error}}
+  </div>
+  {{/if}}
 </template>
 
 <template name="grain">
@@ -470,7 +556,7 @@
     {{grainSize}}
   {{/sandstormTopbarItem}}
 
-  {{>sandstormTopbarBlockReload}}
+  {{>sandstormTopbarBlockReload ""}}
 
   {{setGrainWindowTitle}}
 
@@ -485,7 +571,8 @@
 
   {{#if isOwner}}
     {{>sandstormTopbarItem name="debug-log" topbar=globalTopbar template="grainDebugLogButton" data=globalTopbar}}
-    {{>sandstormTopbarItem name="backup" topbar=globalTopbar template="grainBackupButton" data=globalTopbar}}
+    {{>sandstormTopbarItem name="backup" topbar=globalTopbar template="grainBackupButton"
+                           data=globalTopbar popupTemplate="grainBackupPopup"}}
     {{>sandstormTopbarItem name="restart" topbar=globalTopbar template="grainRestartButton" data=globalTopbar}}
   {{/if}}
 
@@ -496,12 +583,12 @@
     {{/if}}
     {{#if showPowerboxRequest}}
     {{>sandstormTopbarItem name="request" topbar=globalTopbar template="grainPowerboxRequest"
-          startOpen=true popupTemplate="grainPowerboxRequestPopup" data=powerboxRequestData
+          startOpenModal=true popupTemplate="grainPowerboxRequestPopup" data=powerboxRequestData
           onDismiss=cancelPowerboxRequest}}
     {{/if}}
     {{#if showPowerboxOffer}}
       {{>sandstormTopbarItem name="offer" topbar=globalTopbar template="grainPowerboxOffer"
-          startOpen=true popupTemplate="grainPowerboxOfferPopup" data=powerboxOfferData}}
+          startOpenModal=true popupTemplate="grainPowerboxOfferPopup" data=powerboxOfferData}}
     {{/if}}
   {{/if}}
 </template>
@@ -528,4 +615,3 @@
     </div>
   </div>
 </template>
-

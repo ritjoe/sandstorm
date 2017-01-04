@@ -14,20 +14,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { waitPromise } from "/imports/server/async-helpers.js";
+
 const ChildProcess = Npm.require("child_process");
 const Future = Npm.require("fibers/future");
-const Promise = Npm.require("es6-promise").Promise;
 const Capnp = Npm.require("capnp");
 
 const GrainInfo = Capnp.importSystem("sandstorm/grain.capnp").GrainInfo;
 
-const TOKEN_CLEANUP_MINUTES = 15;
+const TOKEN_CLEANUP_MINUTES = 120;  // Give enough time for large uploads on slow connections.
 const TOKEN_CLEANUP_TIMER = TOKEN_CLEANUP_MINUTES * 60 * 1000;
 
 function cleanupToken(tokenId) {
   check(tokenId, String);
-  waitPromise(globalBackend.cap().deleteBackup(tokenId));
   FileTokens.remove({ _id: tokenId });
+  waitPromise(globalBackend.cap().deleteBackup(tokenId));
 }
 
 Meteor.startup(() => {
@@ -63,6 +64,26 @@ Meteor.methods({
 
     FileTokens.insert(token);
     waitPromise(globalBackend.cap().backupGrain(token._id, this.userId, grainId, grainInfo));
+
+    return token._id;
+  },
+
+  newRestoreToken() {
+    if (!isSignedUpOrDemo()) {
+      throw new Meteor.Error(403, "Unauthorized", "Only invited users can restore backups.");
+    }
+
+    if (isUserOverQuota(Meteor.user())) {
+      throw new Meteor.Error(402,
+          "You are out of storage space. Please delete some things and try again.");
+    }
+
+    const token = {
+      _id: Random.id(),
+      timestamp: new Date(),
+    };
+
+    FileTokens.insert(token);
 
     return token._id;
   },
@@ -139,6 +160,7 @@ Meteor.methods({
         identityId: identityId,
         title: grainInfo.title,
         private: true,
+        size: 0,
       });
     } finally {
       cleanupToken(tokenId);
@@ -161,7 +183,7 @@ Router.map(function () {
       }
 
       let started = false;
-      const filename = (token.name.replace(/["\n]/g, "") || "backup") + ".zip";
+      const encodedFilename = encodeURIComponent(token.name || "backup") + ".zip";
       let sawEnd = false;
 
       const stream = {
@@ -171,7 +193,7 @@ Router.map(function () {
             response.writeHead(200, {
               "Content-Length": size,
               "Content-Type": "application/zip",
-              "Content-Disposition": 'attachment;filename=\"' + filename + '\"',
+              "Content-Disposition": "attachment;filename*=utf-8''" + encodedFilename,
             });
           }
         },
@@ -181,7 +203,7 @@ Router.map(function () {
             started = true;
             response.writeHead(200, {
               "Content-Type": "application/zip",
-              "Content-Disposition": 'attachment;filename=\"' + filename + '\"',
+              "Content-Disposition": "attachment;filename*=utf-8''" + encodedFilename,
             });
           }
 
@@ -194,7 +216,7 @@ Router.map(function () {
             response.writeHead(200, {
               "Content-Length": 0,
               "Content-Type": "application/zip",
-              "Content-Disposition": 'attachment;filename=\"' + filename + '\"',
+              "Content-Disposition": "attachment;filename*=utf-8''" + encodedFilename,
             });
           }
 
@@ -220,18 +242,22 @@ Router.map(function () {
 
   this.route("uploadBackup", {
     where: "server",
-    path: "/uploadBackup",
+    path: "/uploadBackup/:token",
     action() {
       if (this.request.method === "POST") {
+        const token = FileTokens.findOne(this.params.token);
+        if (!this.params.token || !token) {
+          this.response.writeHead(403, {
+            "Content-Type": "text/plain",
+          });
+          this.response.write("Invalid upload token.");
+          this.response.end();
+          return;
+        }
+
         const request = this.request;
         try {
-          const token = {
-            _id: Random.id(),
-            timestamp: new Date(),
-          };
-          const stream = globalBackend.cap().uploadBackup(token._id).stream;
-
-          FileTokens.insert(token);
+          const stream = globalBackend.cap().uploadBackup(this.params.token).stream;
 
           waitPromise(new Promise((resolve, reject) => {
             request.on("data", (data) => {
@@ -245,11 +271,7 @@ Router.map(function () {
             });
           }));
 
-          this.response.writeHead(200, {
-            "Content-Length": token._id.length,
-            "Content-Type": "text/plain",
-          });
-          this.response.write(token._id);
+          this.response.writeHead(204);
           this.response.end();
         } catch (error) {
           console.error(error.stack);

@@ -8,8 +8,10 @@ Template.newAdminIdentity.helpers({
 
 const idpData = function (configureCallback) {
   const emailTokenEnabled = globalDb.getSettingWithFallback("emailToken", false);
-  const googleEnabled = globalDb.getSettingWithFallback("google", false);
-  const githubEnabled = globalDb.getSettingWithFallback("github", false);
+  const googleSetting = globalDb.collections.settings.findOne("google");
+  const googleEnabled = (googleSetting && googleSetting.value) || false;
+  const githubSetting = globalDb.collections.settings.findOne("github");
+  const githubEnabled = (githubSetting && githubSetting.value) || false;
   const ldapEnabled = globalDb.getSettingWithFallback("ldap", false);
   const samlEnabled = globalDb.getSettingWithFallback("saml", false);
   return [
@@ -28,6 +30,7 @@ const idpData = function (configureCallback) {
       label: "Google",
       icon: "/google.svg", // Or use identicons
       enabled: googleEnabled,
+      resetNote: !googleEnabled && googleSetting && googleSetting.automaticallyReset,
       popupTemplate: "adminIdentityProviderConfigureGoogle",
       onConfigure() {
         configureCallback("google");
@@ -38,6 +41,7 @@ const idpData = function (configureCallback) {
       label: "GitHub",
       icon: "/github.svg", // Or use identicons
       enabled: githubEnabled,
+      resetNote: !githubEnabled && githubSetting && githubSetting.automaticallyReset,
       popupTemplate: "adminIdentityProviderConfigureGitHub",
       onConfigure() {
         configureCallback("github");
@@ -99,6 +103,11 @@ Template.adminIdentityProviderTable.helpers({
 });
 
 Template.adminIdentityRow.events({
+  "click button.base-url-change-button"() {
+    const instance = Template.instance();
+    instance.data.idp.onConfigure();
+  },
+
   "click button.configure-idp"() {
     const instance = Template.instance();
     instance.data.idp.onConfigure();
@@ -162,8 +171,13 @@ Template.adminIdentityProviderConfigureEmail.events({
 });
 
 Template.adminIdentityProviderConfigureEmail.helpers({
-  emailEnabled() {
+  emailLoginEnabled() {
     return globalDb.getSettingWithFallback("emailToken", false);
+  },
+
+  emailUnconfigured() {
+    const c = globalDb.getSmtpConfig();
+    return (!c.hostname || !c.port || !c.returnAddress);
   },
 
   errorMessage() {
@@ -172,23 +186,25 @@ Template.adminIdentityProviderConfigureEmail.helpers({
   },
 });
 
+function siteUrlNoSlash() {
+  // Google complains if the Javascript origin contains a trailing slash - it wants just the
+  // scheme/host/port, no path.
+  const urlWithTrailingSlash = Meteor.absoluteUrl();
+  return urlWithTrailingSlash[urlWithTrailingSlash.length - 1] === "/" ?
+         urlWithTrailingSlash.slice(0, urlWithTrailingSlash.length - 1) :
+         urlWithTrailingSlash;
+}
+
 Template.googleLoginSetupInstructions.helpers({
-  siteUrlNoSlash() {
-    // Google complains if the Javascript origin contains a trailing slash - it wants just the
-    // scheme/host/port, no path.
-    const urlWithTrailingSlash = Meteor.absoluteUrl();
-    return urlWithTrailingSlash[urlWithTrailingSlash.length - 1] === "/" ?
-           urlWithTrailingSlash.slice(0, urlWithTrailingSlash.length - 1) :
-           urlWithTrailingSlash;
-  },
+  siteUrlNoSlash,
 });
 
 // Google form.
 Template.adminIdentityProviderConfigureGoogle.onCreated(function () {
   const configurations = Package["service-configuration"].ServiceConfiguration.configurations;
   const googleConfiguration = configurations.findOne({ service: "google" });
-  const clientId = googleConfiguration && googleConfiguration.clientId;
-  const clientSecret = googleConfiguration && googleConfiguration.secret;
+  const clientId = (googleConfiguration && googleConfiguration.clientId) || "";
+  const clientSecret = (googleConfiguration && googleConfiguration.secret) || "";
 
   this.clientId = new ReactiveVar(clientId);
   this.clientSecret = new ReactiveVar(clientSecret);
@@ -203,6 +219,14 @@ Template.adminIdentityProviderConfigureGoogle.onRendered(function () {
 });
 
 Template.adminIdentityProviderConfigureGoogle.helpers({
+  formerBaseUrl() {
+    const setting = globalDb.collections.settings.findOne("google");
+    const googleEnabled = (setting && setting.value) || false;
+    return !googleEnabled && setting && setting.automaticallyReset && setting.automaticallyReset.baseUrlChangedFrom;
+  },
+
+  siteUrlNoSlash,
+
   googleEnabled() {
     return globalDb.getSettingWithFallback("google", false);
   },
@@ -253,8 +277,8 @@ Template.adminIdentityProviderConfigureGoogle.events({
     const token = Iron.controller().state.get("token");
     const configuration = {
       service: "google",
-      clientId: instance.clientId.get(),
-      secret: instance.clientSecret.get(),
+      clientId: instance.clientId.get().trim(),
+      secret: instance.clientSecret.get().trim(),
       loginStyle: "redirect",
     };
     // TODO: rework this into a single Meteor method call.
@@ -285,8 +309,8 @@ Template.githubLoginSetupInstructions.helpers({
 Template.adminIdentityProviderConfigureGitHub.onCreated(function () {
   const configurations = Package["service-configuration"].ServiceConfiguration.configurations;
   const githubConfiguration = configurations.findOne({ service: "github" });
-  const clientId = githubConfiguration && githubConfiguration.clientId;
-  const clientSecret = githubConfiguration && githubConfiguration.secret;
+  const clientId = (githubConfiguration && githubConfiguration.clientId) || "";
+  const clientSecret = (githubConfiguration && githubConfiguration.secret) || "";
 
   this.clientId = new ReactiveVar(clientId);
   this.clientSecret = new ReactiveVar(clientSecret);
@@ -303,6 +327,16 @@ Template.adminIdentityProviderConfigureGitHub.onRendered(function () {
 Template.adminIdentityProviderConfigureGitHub.helpers({
   githubEnabled() {
     return globalDb.getSettingWithFallback("github", false);
+  },
+
+  formerBaseUrl() {
+    const setting = globalDb.collections.settings.findOne("github");
+    const googleEnabled = (setting && setting.value) || false;
+    return !googleEnabled && setting && setting.automaticallyReset && setting.automaticallyReset.baseUrlChangedFrom;
+  },
+
+  siteUrl() {
+    return Meteor.absoluteUrl();
   },
 
   clientId() {
@@ -345,8 +379,8 @@ Template.adminIdentityProviderConfigureGitHub.events({
     const token = Iron.controller().state.get("token");
     const configuration = {
       service: "github",
-      clientId: instance.clientId.get(),
-      secret: instance.clientSecret.get(),
+      clientId: instance.clientId.get().trim(),
+      secret: instance.clientSecret.get().trim(),
       loginStyle: "redirect",
     };
     // TODO: rework this into a single Meteor method call.
@@ -383,6 +417,7 @@ Template.adminIdentityProviderConfigureLdap.onCreated(function () {
   const nameField = globalDb.getLdapNameField() || "cn";
   const emailField = globalDb.getLdapEmailField() || "mail";
   const filter = globalDb.getLdapFilter();
+  const ldapCaCert = globalDb.getLdapCaCert();
 
   this.ldapUrl = new ReactiveVar(url);
   this.ldapSearchBindDn = new ReactiveVar(searchBindDn);
@@ -392,6 +427,7 @@ Template.adminIdentityProviderConfigureLdap.onCreated(function () {
   this.ldapNameField = new ReactiveVar(nameField);
   this.ldapEmailField = new ReactiveVar(emailField);
   this.ldapFilter = new ReactiveVar(filter);
+  this.ldapCaCert = new ReactiveVar(ldapCaCert);
   this.errorMessage = new ReactiveVar(undefined);
   this.formChanged = new ReactiveVar(false);
   this.setAccountSettingCallback = setAccountSettingCallback.bind(this);
@@ -425,6 +461,11 @@ Template.adminIdentityProviderConfigureLdap.helpers({
   ldapFilter() {
     const instance = Template.instance();
     return instance.ldapFilter.get();
+  },
+
+  ldapCaCert() {
+    const instance = Template.instance();
+    return instance.ldapCaCert.get();
   },
 
   ldapSearchBindDn() {
@@ -517,6 +558,18 @@ Template.adminIdentityProviderConfigureLdap.events({
     instance.formChanged.set(true);
   },
 
+  "change textarea[name=ldapCaCert]"(evt) {
+    const instance = Template.instance();
+    instance.ldapCaCert.set(evt.currentTarget.value);
+    instance.formChanged.set(true);
+  },
+
+  "paste textarea[name=ldapCaCert]"(evt) {
+    const instance = Template.instance();
+    instance.ldapCaCert.set(evt.currentTarget.value);
+    instance.formChanged.set(true);
+  },
+
   "click .idp-modal-disable"(evt) {
     const instance = Template.instance();
     const token = Iron.controller().state.get("token");
@@ -530,14 +583,15 @@ Template.adminIdentityProviderConfigureLdap.events({
 
     // A list of settings to save with the setSetting method, in order.
     const settingsToSave = [
-      { name: "ldapUrl",                value: instance.ldapUrl.get() },
-      { name: "ldapSearchBindDn",       value: instance.ldapSearchBindDn.get() },
-      { name: "ldapSearchBindPassword", value: instance.ldapSearchBindPassword.get() },
-      { name: "ldapBase",               value: instance.ldapBase.get() },
-      { name: "ldapSearchUsername",     value: instance.ldapSearchUsername.get() },
-      { name: "ldapNameField",          value: instance.ldapNameField.get() },
-      { name: "ldapEmailField",         value: instance.ldapEmailField.get() },
-      { name: "ldapFilter",             value: instance.ldapFilter.get() },
+      { name: "ldapUrl",                value: instance.ldapUrl.get().trim() },
+      { name: "ldapSearchBindDn",       value: instance.ldapSearchBindDn.get().trim() },
+      { name: "ldapSearchBindPassword", value: instance.ldapSearchBindPassword.get().trim() },
+      { name: "ldapBase",               value: instance.ldapBase.get().trim() },
+      { name: "ldapSearchUsername",     value: instance.ldapSearchUsername.get().trim() },
+      { name: "ldapNameField",          value: instance.ldapNameField.get().trim() },
+      { name: "ldapEmailField",         value: instance.ldapEmailField.get().trim() },
+      { name: "ldapFilter",             value: instance.ldapFilter.get().trim() },
+      { name: "ldapCaCert",             value: instance.ldapCaCert.get().trim() },
     ];
 
     const saveSettings = function (settingList, errback, callback) {
@@ -577,10 +631,12 @@ Template.adminIdentityProviderConfigureLdap.events({
 // SAML form.
 Template.adminIdentityProviderConfigureSaml.onCreated(function () {
   const samlEntryPoint = globalDb.getSamlEntryPoint();
+  const samlLogout = globalDb.getSamlLogout();
   const samlPublicCert = globalDb.getSamlPublicCert();
   const samlEntityId = globalDb.getSamlEntityId() || window.location.hostname;
 
   this.samlEntryPoint = new ReactiveVar(samlEntryPoint);
+  this.samlLogout = new ReactiveVar(samlLogout);
   this.samlPublicCert = new ReactiveVar(samlPublicCert);
   this.samlEntityId = new ReactiveVar(samlEntityId);
   this.errorMessage = new ReactiveVar(undefined);
@@ -601,6 +657,11 @@ Template.adminIdentityProviderConfigureSaml.helpers({
   samlEntryPoint() {
     const instance = Template.instance();
     return instance.samlEntryPoint.get();
+  },
+
+  samlLogout() {
+    const instance = Template.instance();
+    return instance.samlLogout.get();
   },
 
   samlPublicCert() {
@@ -632,6 +693,10 @@ Template.adminIdentityProviderConfigureSaml.helpers({
     return Meteor.absoluteUrl("_saml/validate/default");
   },
 
+  logoutUrl() {
+    return Meteor.absoluteUrl("saml/logout/default");
+  },
+
   configUrl() {
     return Meteor.absoluteUrl("_saml/config/default");
   },
@@ -641,6 +706,12 @@ Template.adminIdentityProviderConfigureSaml.events({
   "input input[name=entryPoint]"(evt) {
     const instance = Template.instance();
     instance.samlEntryPoint.set(evt.currentTarget.value);
+    instance.formChanged.set(true);
+  },
+
+  "input input[name=logout]"(evt) {
+    const instance = Template.instance();
+    instance.samlLogout.set(evt.currentTarget.value);
     instance.formChanged.set(true);
   },
 
@@ -664,9 +735,10 @@ Template.adminIdentityProviderConfigureSaml.events({
 
   "click .idp-modal-save"(evt) {
     const instance = Template.instance();
-    const samlEntryPoint = instance.samlEntryPoint.get();
-    const samlPublicCert = instance.samlPublicCert.get();
-    const samlEntityId = instance.samlEntityId.get();
+    const samlEntryPoint = instance.samlEntryPoint.get().trim();
+    const samlLogout = instance.samlLogout.get().trim();
+    const samlPublicCert = instance.samlPublicCert.get().trim();
+    const samlEntityId = instance.samlEntityId.get().trim();
     const token = Iron.controller().state.get("token");
     // TODO: rework this into a single Meteor method call.
     Meteor.call("setSetting", token, "samlEntryPoint", samlEntryPoint, (err) => {
@@ -681,7 +753,13 @@ Template.adminIdentityProviderConfigureSaml.events({
               if (err) {
                 instance.errorMessage.set(err.message);
               } else {
-                Meteor.call("setAccountSetting", token, "saml", true, instance.setAccountSettingCallback);
+                Meteor.call("setSetting", token, "samlLogout", samlLogout, (err) => {
+                  if (err) {
+                    instance.errorMessage.set(err.message);
+                  } else {
+                    Meteor.call("setAccountSetting", token, "saml", true, instance.setAccountSettingCallback);
+                  }
+                });
               }
             });
           }

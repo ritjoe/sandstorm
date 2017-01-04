@@ -135,6 +135,9 @@
     >div[role=columnheader]:not(:first-child) {
       border-left: 1px solid $default-table-header-border-color;
     }
+    .created, .last-active {
+      cursor: pointer;
+    }
   }
 
   .loading-row {
@@ -289,7 +292,7 @@
 }
 
 .role-explanations {
-  list-item-style: none;
+  list-style-type: none;
   padding: 0;
   margin-bottom: 16px;
   >li {
@@ -418,9 +421,6 @@
       background-color: $default-table-row-background-color;
       &:not(:last-child) {
         border-bottom: 1px solid #dddddd;
-      }
-      &:hover {
-        background-color: $default-table-row-background-color-hover;
       }
 
       .admin-user-identity-body-cell {

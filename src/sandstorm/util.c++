@@ -58,7 +58,7 @@ kj::AutoCloseFd raiiOpen(kj::StringPtr name, int flags, mode_t mode) {
 
 kj::AutoCloseFd raiiOpenAt(int dirfd, kj::StringPtr name, int flags, mode_t mode) {
   int fd;
-  if (flags & O_TMPFILE) {
+  if ((flags & O_TMPFILE) == O_TMPFILE) {
     // work around glibc bug: https://sourceware.org/bugzilla/show_bug.cgi?id=17523
     KJ_SYSCALL(fd = syscall(SYS_openat, dirfd, name.cStr(), flags, mode), name);
   } else {
@@ -750,6 +750,90 @@ kj::String hexEncode(kj::ArrayPtr<const byte> input) {
   return kj::strArray(KJ_MAP(b, input) { return kj::heapArray<char>({DIGITS[b/16], DIGITS[b%16]}); }, "");
 }
 
+static uint fromDigit(char c) {
+  if ('0' <= c && c <= '9') {
+    return c - '0';
+  } else if ('a' <= c && c <= 'z') {
+    return c - ('a' - 10);
+  } else if ('A' <= c && c <= 'Z') {
+    return c - ('A' - 10);
+  } else {
+    return 0;
+  }
+}
+
+kj::String percentEncode(kj::ArrayPtr<const byte> bytes) {
+  const char HEX_DIGITS[] = "0123456789abcdef";
+  kj::Vector<char> result(bytes.size() + 1);
+  for (byte b: bytes) {
+    if (('A' <= b && b <= 'Z') || ('a' <= b && b <= 'z') || ('0' <= b && b <= '9') ||
+        b == '-' || b == '_' || b == '.' || b == '~') {
+      result.add(b);
+    } else {
+      result.add('%');
+      result.add(HEX_DIGITS[b/16]);
+      result.add(HEX_DIGITS[b%16]);
+    }
+  }
+  result.add('\0');
+  return kj::String(result.releaseAsArray());
+}
+
+kj::String percentEncode(kj::StringPtr text) {
+  return percentEncode(text.asBytes());
+}
+
+kj::Array<byte> percentDecode(kj::StringPtr text) {
+  kj::Vector<byte> result(text.size());
+
+  const char* ptr = text.cStr();
+  while (*ptr != 0) {
+    if (*ptr == '%') {
+      ++ptr;
+      if (*ptr == 0) break;
+      byte b = fromDigit(*ptr++) << 4;
+      if (*ptr == 0) break;
+      b |= fromDigit(*ptr++);
+      result.add(b);
+    } else {
+      result.add(*ptr++);
+    }
+  }
+
+  return result.releaseAsArray();
+}
+
+bool HeaderWhitelist::matches(kj::StringPtr header) const {
+  // Convert to lower-case on stack.
+  KJ_STACK_ARRAY(char, buffer, header.size() + 1, 64, 256);
+  memcpy(buffer.begin(), header.begin(), buffer.size());
+  toLower(buffer);
+  header = kj::StringPtr(buffer.begin(), header.size());
+
+  auto iter = patterns.lower_bound(header);
+  if (iter != patterns.end() && *iter == header) {
+    return true;
+  }
+
+  if (iter == patterns.begin()) return false;
+
+  // If there is a prefix that matches, it will be the item immediately before the lower_bound,
+  // because the character '*' sorts before all characters that are valid inside headers.
+  --iter;
+  if (iter->endsWith("*")) {
+    // Check if prefix matches.
+    auto prefix = iter->slice(0, iter->size() - 1);
+    if (header.size() >= prefix.size() &&
+        memcmp(header.begin(), prefix.begin(), prefix.size()) == 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// =======================================================================================
+
 Subprocess::Subprocess(Options&& options)
     : name(kj::heapString(options.argv.size() > 0 ? options.argv[0] : options.executable)) {
   KJ_SYSCALL(pid = fork());
@@ -793,6 +877,14 @@ Subprocess::Subprocess(Options&& options)
 
       for (auto i: kj::indices(options.moreFds)) {
         KJ_SYSCALL(dup2(options.moreFds[i], STDERR_FILENO + 1 + i));
+      }
+
+      // Drop privileges if requested.
+      KJ_IF_MAYBE(g, options.gid) {
+        KJ_SYSCALL(setresgid(*g, *g, *g));
+      }
+      KJ_IF_MAYBE(u, options.uid) {
+        KJ_SYSCALL(setresuid(*u, *u, *u));
       }
 
       // Make the args vector.

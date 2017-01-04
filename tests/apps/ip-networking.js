@@ -14,10 +14,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Here we are testing a toy app (see https://github.com/jparyani/sandstorm-test-app/tree/ip-network
-// for the code). It has a "request" button that tests the basics of an IpNetwork
-
 "use strict";
+
+// Tests the `IpNetwork` and `IpInterface` capabilities using the sandstorm-test-python app.
+// The app's source code is hosted at https://github.com/sandstorm-io/sandstorm-test-python.
 
 var utils = require("../utils"),
     short_wait = utils.short_wait,
@@ -31,17 +31,19 @@ module.exports = {};
 
 module.exports["Test Ip Networking"] = function (browser) {
   browser
-    // sandstorm-test-python, v0.0.9
-    .installApp("https://alpha-hlngxit86q1mrs2iplnx.sandstorm.io/test-9.spk", "38372232883942128f66d0a4d3818bbf", "rwyva77wj1pnj01cjdj2kvap7c059n9ephyyg5k4s5enh5yw9rxh", false, true)
+    .loginDevAccount(null, true)
+    .installApp("https://alpha-hlngxit86q1mrs2iplnx.sandstorm.io/test-11.spk",
+                "9e431ec70f1ee66901bb73f48687f485",
+                "rwyva77wj1pnj01cjdj2kvap7c059n9ephyyg5k4s5enh5yw9rxh")
     .assert.containsText("#grainTitle", "Untitled Test App test page")
     .waitForElementVisible('.grain-frame', short_wait)
-    .frame("grain-frame")
+    .grainFrame()
       .waitForElementVisible("#powerbox-request-ipnetwork", short_wait)
       .click("#powerbox-request-ipnetwork")
     .frameParent()
     .waitForElementVisible(".popup.request .candidate-cards .powerbox-card button[data-card-id=frontendref-ipnetwork]", short_wait)
     .click(".popup.request .candidate-cards .powerbox-card button[data-card-id=frontendref-ipnetwork]")
-    .frame("grain-frame")
+    .grainFrame()
       .waitForElementVisible("span.token", short_wait)
       .waitForElementVisible("form.test-ip-network input[type=text]", short_wait)
       .setValue("form.test-ip-network input[type=text]", "http://build.sandstorm.io")
@@ -53,23 +55,31 @@ module.exports["Test Ip Networking"] = function (browser) {
 
 module.exports["Test Ip Interface"] = function (browser) {
   browser
-    // sandstorm-test-python, v0.0.9
-    .installApp("https://alpha-hlngxit86q1mrs2iplnx.sandstorm.io/test-9.spk", "38372232883942128f66d0a4d3818bbf", "rwyva77wj1pnj01cjdj2kvap7c059n9ephyyg5k4s5enh5yw9rxh", false, true)
+    .loginDevAccount(null, true)
+    .installApp("https://alpha-hlngxit86q1mrs2iplnx.sandstorm.io/test-11.spk",
+                "9e431ec70f1ee66901bb73f48687f485",
+                "rwyva77wj1pnj01cjdj2kvap7c059n9ephyyg5k4s5enh5yw9rxh")
     .assert.containsText("#grainTitle", "Untitled Test App test page")
     .waitForElementVisible('.grain-frame', short_wait)
-    .frame("grain-frame")
+    .grainFrame()
       .waitForElementVisible("#powerbox-request-ipinterface", short_wait)
       .click("#powerbox-request-ipinterface")
     .frameParent()
     .waitForElementVisible(".popup.request .candidate-cards .powerbox-card button[data-card-id=frontendref-ipinterface]", short_wait)
     .click(".popup.request .candidate-cards .powerbox-card button[data-card-id=frontendref-ipinterface]")
-    .frame("grain-frame")
+    .grainFrame()
       .waitForElementVisible("span.token", short_wait)
       .waitForElementVisible("form.test-ip-interface input[type=number]", short_wait)
       .setValue("form.test-ip-interface input[type=number]", IP_INTERFACE_TEST_PORT)
       .click("form.test-ip-interface button")
+      .waitForElementVisible("form.test-ip-interface div.result", short_wait)
+      .assert.containsText("form.test-ip-interface div.result", "listening on")
     .frameParent()
     .assertTcpConnection(IP_INTERFACE_TEST_PORT, "tcptest")
-    .end()
+    .grainFrame()
+      .waitForElementNotPresent("form.test-ip-interface input[disabled]", short_wait)
+      .assert.containsText("form.test-ip-interface div.result", "success")
+    .frameParent()
+    .end();
 };
 

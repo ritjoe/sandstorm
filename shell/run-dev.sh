@@ -85,6 +85,7 @@ cat > $SETTINGS << __EOF__
     "wildcardHost": "$WILDCARD_HOST",
     "quotaEnabled": ${QUOTA_ENABLED:-false},
     "stripePublicKey": "${STRIPE_PUBLIC_KEY:-}",
+    "outOfBeta": ${OUT_OF_BETA:-false},
     "smtpListenPort": ${SMTP_LISTEN_PORT:-30025}
   },
   "home": "$SANDSTORM_HOME",
@@ -93,9 +94,5 @@ cat > $SETTINGS << __EOF__
   "mailchimpKey": "${MAILCHIMP_KEY:-}"
 }
 __EOF__
-
-# Work-around for problem where Meteor's bundled npm prefers the system gyp
-# over its own bundled version, and the system gyp doesn't work.
-export PYTHONPATH=$("$SCRIPT_DIR/../find-meteor-dev-bundle.sh")/lib/node_modules/npm/node_modules/node-gyp/gyp/pylib
 
 exec meteor run --port=$BIND_IP:$PORT --settings $SETTINGS

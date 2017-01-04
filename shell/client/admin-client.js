@@ -19,10 +19,12 @@ Meteor.subscribe("publicAdminSettings");
 const newAdminRoute = RouteController.extend({
   template: "newAdmin",
   waitOn: function () {
+    const token = sessionStorage.getItem("setup-token");
+
     const subs = [
-      Meteor.subscribe("admin", this.params._token),
-      Meteor.subscribe("adminServiceConfiguration", this.params._token),
-      Meteor.subscribe("featureKey", true, this.params._token),
+      Meteor.subscribe("admin", token),
+      Meteor.subscribe("adminServiceConfiguration", token),
+      Meteor.subscribe("featureKey", true, token),
     ];
 
     return subs;
@@ -35,8 +37,17 @@ const newAdminRoute = RouteController.extend({
     const websocketSeemsBroken = (
       Session.get("websocketSeemsBroken")
     );
+
+    const hasSetupToken = !!sessionStorage.getItem("setup-token");
+
+    // Most of the admin panel requires login, but we make a special exception for viewing the
+    // system log, since this is important for debugging problems that could be preventing login.
+    const isUserPermittedBySetupToken = hasSetupToken &&
+        Router.current().route.getName() == "newAdminStatus";
+
     return {
-      isUserPermitted: isAdmin(),
+      hasSetupToken,
+      isUserPermitted: isAdmin() || isUserPermittedBySetupToken,
       wildcardHostSeemsBroken,
       websocketSeemsBroken,
     };
@@ -136,6 +147,10 @@ Router.map(function () {
     path: "/admin/app-sources",
     controller: newAdminRoute,
   });
+  this.route("newAdminPreinstalledApps", {
+    path: "/admin/preinstalled-apps",
+    controller: newAdminRoute,
+  });
   this.route("newAdminMaintenance", {
     path: "/admin/maintenance",
     controller: newAdminRoute,
@@ -162,6 +177,10 @@ Router.map(function () {
   });
   this.route("newAdminOrganization", {
     path: "/admin/organization",
+    controller: newAdminRoute,
+  });
+  this.route("newAdminHostingManagement", {
+    path: "/admin/hosting-management",
     controller: newAdminRoute,
   });
 });

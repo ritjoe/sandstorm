@@ -6,7 +6,7 @@
     margin-top: 0;
     //padding-top: 12px;
     padding-bottom: 12px;
-    border-bottom: 1px solid #a2a2a2;
+    border-bottom: 1px solid $default-rule-color;
   }
 
   h2 {
@@ -99,7 +99,9 @@
 @import "_admin-personalization.scss";
 @import "_admin-network-capabilities.scss";
 @import "_admin-apps.scss";
+@import "_admin-preinstalled-apps.scss";
 @import "_admin-maintenance.scss";
 @import "_admin-users.scss";
 @import "_admin-stats.scss";
 @import "_admin-feature-key.scss";
+@import "_admin-hosting-management.scss";

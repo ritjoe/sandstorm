@@ -31,6 +31,7 @@
 #include <kj/async.h>
 #include <capnp/rpc-twoparty.h>
 #include <sandstorm/util.capnp.h>
+#include <set>
 
 namespace kj {
   class UnixEventPort;
@@ -38,15 +39,10 @@ namespace kj {
 
 namespace sandstorm {
 
-#if __QTCREATOR
-#define KJ_MVCAP(var) var
-// QtCreator dosen't understand C++14 syntax yet.
-#else
 #define KJ_MVCAP(var) var = ::kj::mv(var)
 // Capture the given variable by move.  Place this in a lambda capture list.  Requires C++14.
 //
 // TODO(cleanup):  Move to libkj.
-#endif
 
 typedef unsigned int uint;
 typedef unsigned char byte;
@@ -228,6 +224,26 @@ kj::Array<byte> base64Decode(kj::StringPtr input);
 kj::String hexEncode(kj::ArrayPtr<const byte> input);
 // Return the hex string corresponding to this array of bytes.
 
+kj::String percentEncode(kj::StringPtr text);
+kj::String percentEncode(kj::ArrayPtr<const byte> bytes);
+kj::Array<byte> percentDecode(kj::StringPtr text);
+// URL-safe encode using % escapes.
+
+class HeaderWhitelist {
+  // Given a list of strings, some of which end in '*', create an efficient whitelist matcher,
+  // where the *'s are wildcards. The input whitelist must be all-lowercase, but the matching is
+  // case-insensitive.
+
+public:
+  template <typename T>
+  HeaderWhitelist(T&& list): patterns(list.begin(), list.end()) {}
+
+  bool matches(kj::StringPtr header) const;
+
+private:
+  std::set<kj::StringPtr> patterns;
+};
+
 class SubprocessSet;
 
 class Subprocess {
@@ -263,6 +279,11 @@ public:
     kj::Maybe<kj::ArrayPtr<const kj::StringPtr>> environment;
     // An array of 'NAME=VALUE' pairs specifying the child's environment. If null, inherits the
     // parent's environment.
+
+    kj::Maybe<uid_t> uid;
+    kj::Maybe<gid_t> gid;
+    // Values to change the UID and GID to in the child process before exec. Leave null for no
+    // change.
 
     Options(kj::StringPtr executable): executable(executable), argv(&this->executable, 1) {}
     Options(kj::ArrayPtr<const kj::StringPtr> argv): executable(argv[0]), argv(argv) {}

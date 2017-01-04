@@ -20,6 +20,7 @@
 $import "/capnp/c++.capnp".namespace("sandstorm::spk");
 
 using Util = import "util.capnp";
+using Powerbox = import "powerbox.capnp";
 using Grain = import "grain.capnp";
 
 struct PackageDefinition {
@@ -131,7 +132,7 @@ struct Manifest {
       none @0 :Void;
       # This action creates a new grain with no input.
 
-      capability @1 :List(Grain.PowerboxDescriptor);
+      capability @1 :List(Powerbox.PowerboxDescriptor);
       # This action creates a new grain from a powerbox offer. When a capability matching the query
       # is offered to the user (e.g. by another application calling SessionContext.offer()), this
       # action will be listed as one of the things the user can do with it.
@@ -215,6 +216,11 @@ struct BridgeConfig {
   # holder is allowed to do, you MUST use permissions and enforce them for both API and UI
   # requests. See:
   #     https://docs.sandstorm.io/en/latest/developing/auth/
+
+  saveIdentityCaps @2 :Bool;
+  # If true, the first time a new user accesses the grain, the bridge will save the user's Identity
+  # capability so that it can be fetched later using `SandstormHttpBridge.getSavedIdentity`. You
+  # will probably want to enable this if your app supports notifications.
 }
 
 struct Metadata {
@@ -222,7 +228,7 @@ struct Metadata {
   # marketing and display.
   #
   # Technically, appMarketingVersion and appTitle belong in this category, but they were defined
-  # before MarketData became a thing.
+  # before Metadata became a thing.
   #
   # NOTE: Any changes here which add new blobs may require updating the front-end so that it
   #   correctly extracts those blobs into separate assets on install.

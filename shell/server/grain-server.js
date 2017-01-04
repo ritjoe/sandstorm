@@ -15,6 +15,9 @@
 // limitations under the License.
 
 const Crypto = Npm.require("crypto");
+import { send as sendEmail } from "/imports/server/email.js";
+
+const ROOT_URL = process.env.ROOT_URL;
 
 const emailLinkWithInlineStyle = function (url, text) {
   return "<a href='" + url + "' style='display:inline-block;text-decoration:none;" +
@@ -82,7 +85,7 @@ Meteor.publish("packageByGrainId", function (grainId) {
   return publishThis;
 });
 
-Meteor.publish("tokenInfo", function (token) {
+Meteor.publish("tokenInfo", function (token, isStandalone) {
   // Allows the client side to map a raw token to its entry in ApiTokens, and the additional
   // metadata that it will need to display the app icon and title.  We do not care about making
   // the metadata reactive.
@@ -131,7 +134,7 @@ Meteor.publish("tokenInfo", function (token) {
           this.added("tokenInfo", token, { invalidToken: true });
         }
       } else if (!apiToken.owner || "webkey" in apiToken.owner) {
-        if (this.userId) {
+        if (this.userId && !isStandalone) {
           const user = Meteor.users.findOne({ _id: this.userId });
           const identityIds = SandstormDb.getUserIdentityIds(user);
           const childToken = ApiTokens.findOne({
@@ -213,186 +216,14 @@ Meteor.publish("requestingAccess", function (grainId) {
   this.onStop(() => handle.stop());
 });
 
-Meteor.publish("grainSize", function (grainId) {
-  // Publish pseudo-collection containing the size of the grain opened in the given session.
-  check(grainId, String);
-
-  const grain = Grains.findOne(grainId);
-  if (!grain || grain.userId !== this.userId) {
-    return [];
-  }
-
-  const supervisor = globalBackend.cap().getGrain(this.userId, grainId).supervisor;
-
-  const _this = this;
-  let stopped = false;
-  let promise = getGrainSize(supervisor);
-
-  function getNext(oldSize) {
-    promise = getGrainSize(supervisor, oldSize);
-    promise.then(function (size) {
-      if (!stopped) {
-        if (size !== oldSize) {  // sometimes there are false alarms
-          _this.changed("grainSizes", grainId, { size: size });
-        }
-
-        getNext(size);
-      }
-    }, function (err) {
-
-      if (!stopped) {
-        if (err.kjType === "disconnected") {
-          _this.stop();
-        } else {
-          _this.error(err);
-        }
-      }
-    });
-  }
-
-  promise.then(function (size) {
-    if (!stopped) {
-      _this.added("grainSizes", grainId, { size: size });
-      _this.ready();
-      getNext(size);
-    }
-  }, function (err) {
-
-    if (!stopped) {
-      if (err.kjType === "disconnected") {
-        _this.stop();
-      } else {
-        _this.error(err);
-      }
-    }
-  });
-
-  _this.onStop(function () {
-    stopped = true;
-    promise.cancel();
-  });
-});
-
 const GRAIN_DELETION_MS = 1000 * 60 * 60 * 24 * 30; // thirty days
 SandstormDb.periodicCleanup(86400000, () => {
   const trashExpiration = new Date(Date.now() - GRAIN_DELETION_MS);
   globalDb.removeApiTokens({ trashed: { $lt: trashExpiration } });
-  Grains.find({ trashed: { $lt: trashExpiration } }).forEach((grain) => {
-    waitPromise(globalBackend.deleteGrain(grain._id, grain.userId));
-    Grains.remove({ _id: grain._id });
-    globalDb.removeApiTokens({
-      grainId: grain._id,
-      $or: [
-        { owner: { $exists: false } },
-        { owner: { webkey: null } },
-      ],
-    });
-
-    if (grain.lastUsed) {
-      DeleteStats.insert({
-        type: "grain",  // Demo grains can never never get here!
-        lastActive: grain.lastUsed,
-        appId: grain.appId,
-      });
-    }
-
-    Meteor.call("deleteUnusedPackages", grain.appId);
-  });
+  globalDb.deleteGrains({ trashed: { $lt: trashExpiration } }, globalBackend, "grain");
 });
 
 Meteor.methods({
-  moveGrainsToTrash: function (grainIds) {
-    check(grainIds, [String]);
-
-    if (this.userId) {
-      Grains.update({ userId: { $eq: this.userId },
-                      _id: { $in: grainIds },
-                      trashed: { $exists: false }, },
-                    { $set: { trashed: new Date() } },
-                    { multi: true });
-
-      const identityIds = SandstormDb.getUserIdentityIds(Meteor.user());
-
-      ApiTokens.update({ grainId: { $in: grainIds },
-                        "owner.user.identityId": { $in: identityIds },
-                        trashed: { $exists: false }, },
-                       { $set: { "trashed": new Date() } },
-                       { multi: true });
-    }
-  },
-
-  moveGrainsOutOfTrash: function (grainIds) {
-    check(grainIds, [String]);
-
-    if (this.userId) {
-      Grains.update({ userId: { $eq: this.userId },
-                      _id: { $in: grainIds },
-                      trashed: { $exists: true }, },
-                    { $unset: { trashed: 1 } },
-                    { multi: true });
-
-      const identityIds = SandstormDb.getUserIdentityIds(Meteor.user());
-
-      ApiTokens.update({ grainId: { $in: grainIds },
-                        "owner.user.identityId": { $in: identityIds },
-                        "trashed": { $exists: true }, },
-                       { $unset: { "trashed": 1 } },
-                       { multi: true });
-    }
-  },
-
-  deleteGrain: function (grainId) {
-    check(grainId, String);
-
-    if (this.userId) {
-      if (!this.isSimulation) {
-        waitPromise(globalBackend.deleteGrain(grainId, this.userId));
-      }
-
-      const grain = Grains.findOne({
-        _id: grainId,
-        userId: this.userId,
-        trashed: { $exists: true },
-      });
-      if (grain) {
-        Grains.remove(grainId);
-        globalDb.removeApiTokens({
-          grainId: grainId,
-          $or: [
-            { owner: { $exists: false } },
-            { owner: { webkey: null } },
-          ],
-        });
-        if (grain.lastUsed) {
-          DeleteStats.insert({ type: isDemoUser() ? "demoGrain" : "grain",
-                              lastActive: grain.lastUsed, appId: grain.appId, });
-        }
-
-        if (!this.isSimulation) {
-          Meteor.call("deleteUnusedPackages", grain.appId);
-        }
-      }
-    }
-  },
-
-  forgetGrain: function (grainId, identityId) {
-    check(grainId, String);
-    check(identityId, String);
-
-    if (!this.userId) {
-      throw new Meteor.Error(403, "Must be logged in to forget a grain.");
-    }
-
-    if (!globalDb.userHasIdentity(this.userId, identityId)) {
-      throw new Meteor.Error(403, "Current user does not have the identity " + identityId);
-    }
-
-    globalDb.removeApiTokens({ grainId: grainId,
-                              "owner.user.identityId": identityId,
-                              "trashed": { $exists: true },
-                            });
-  },
-
   updateGrainPreferredIdentity: function (grainId, identityId) {
     check(grainId, String);
     check(identityId, String);
@@ -475,10 +306,16 @@ Meteor.methods({
     }
   },
 
-  inviteUsersToGrain: function (origin, identityId, grainId, title, roleAssignment,
+  inviteUsersToGrain: function (_origin, identityId, grainId, title, roleAssignment,
                                 contacts, message) {
+    if (typeof message === "object") {
+      // Older versions of the client passed an object here, but we only care about the `text`
+      // parameter. (This block can eventually be removed.)
+      message = message.text;
+    }
+
     if (!this.isSimulation) {
-      check(origin, String);
+      check(_origin, String);
       check(identityId, String);
       check(grainId, String);
       check(title, String);
@@ -494,7 +331,7 @@ Meteor.methods({
           }),
         },
       ]);
-      check(message, { text: String, html: String });
+      check(message, String);
       if (!this.userId) {
         throw new Meteor.Error(403, "Must be logged in to share by email.");
       }
@@ -511,6 +348,12 @@ Meteor.methods({
         throw new Meteor.Error(403, "Demo users are not allowed to share by email.");
       }
 
+      const escapedMessage = message.replace(/&/g, "&amp;")
+                                    .replace(/</g, "&lt;")
+                                    .replace(/>/g, "&gt;")
+                                    .replace(/"/g, "&quot;")
+                                    .replace(/\n/g, "<br>");
+
       const accountId = this.userId;
       const outerResult = { successes: [], failures: [] };
       const fromEmail = globalDb.getReturnAddressWithDisplayName(identityId);
@@ -522,20 +365,20 @@ Meteor.methods({
             globalDb, { identityId: identityId, accountId: accountId }, grainId,
             "email invitation for " + emailAddress,
             roleAssignment, { webkey: { forSharing: true } });
-          const url = origin + "/shared/" + result.token;
-          const html = message.html + "<br><br>" +
+          const url = ROOT_URL + "/shared/" + result.token;
+          const html = escapedMessage + "<br><br>" +
               emailLinkWithInlineStyle(url, "Open Shared Grain") +
               "<div style='font-size:8pt;font-style:italic;color:gray'>" +
               "Note: If you forward this email to other people, they will be able to access " +
               "the share as well. To prevent this, remove the button before forwarding.</div>";
           try {
             globalDb.incrementDailySentMailCount(accountId);
-            SandstormEmail.send({
+            sendEmail({
               to: emailAddress,
               from: fromEmail,
               replyTo: replyTo,
               subject: title + " - Invitation to collaborate",
-              text: message.text + "\n\nFollow this link to open the shared grain:\n\n" + url +
+              text: message + "\n\nFollow this link to open the shared grain:\n\n" + url +
                 "\n\nNote: If you forward this email to other people, they will be able to " +
                 "access the share as well. To prevent this, remove the link before forwarding.",
               html: html,
@@ -548,7 +391,7 @@ Meteor.methods({
             globalDb, { identityId: identityId, accountId: accountId }, grainId,
             "direct invitation to " + contact.profile.intrinsicName,
             roleAssignment, { user: { identityId: contact._id, title: title } });
-          const url = origin + "/shared/" + result.token;
+          const url = ROOT_URL + "/shared/" + result.token;
           try {
             const identity = Meteor.users.findOne({ _id: contact._id });
             const email = _.findWhere(SandstormDb.getVerifiedEmails(identity),
@@ -570,18 +413,18 @@ Meteor.methods({
                 throw new Meteor.Error(500, "Unknown service to email share link.");
               }
 
-              const html = message.html + "<br><br>" +
+              const html = escapedMessage + "<br><br>" +
                   emailLinkWithInlineStyle(url, "Open Shared Grain") +
                   "<div style='font-size:8pt;font-style:italic;color:gray'>" +
                   "Note: You will need to log in with your " + loginNote +
                   " to access this grain.";
               globalDb.incrementDailySentMailCount(accountId);
-              SandstormEmail.send({
+              sendEmail({
                 to: email.email,
                 from: fromEmail,
                 replyTo: replyTo,
                 subject: title + " - Invitation to collaborate",
-                text: message.text + "\n\nFollow this link to open the shared grain:\n\n" + url +
+                text: message + "\n\nFollow this link to open the shared grain:\n\n" + url +
                   "\n\nNote: You will need to log in with your " + loginNote +
                   " to access this grain.",
                 html: html,
@@ -603,8 +446,8 @@ Meteor.methods({
     }
   },
 
-  requestAccess: function (origin, grainId, identityId) {
-    check(origin, String);
+  requestAccess: function (_origin, grainId, identityId) {
+    check(_origin, String);
     check(grainId, String);
     check(identityId, String);
     if (!this.isSimulation) {
@@ -652,7 +495,7 @@ Meteor.methods({
       const message = identity.profile.name + identityNote +
             " is requesting access to your grain: " + grain.title + ".";
 
-      const url = origin + "/share/" + grainId + "/" + identityId;
+      const url = ROOT_URL + "/share/" + grainId + "/" + identityId;
 
       let html = message + "<br><br>" +
           emailLinkWithInlineStyle(url, "Open Sharing Menu");
@@ -680,7 +523,7 @@ Meteor.methods({
 
       Meteor.users.update({ _id: user._id }, modifier);
 
-      SandstormEmail.send({
+      sendEmail({
         to: emailAddress,
         from: fromEmail,
         replyTo: replyTo,

@@ -17,8 +17,11 @@
 import { Meteor } from "meteor/meteor";
 import Fs from "fs";
 import Crypto from "crypto";
-import { clearAdminToken, checkAuth, tokenIsValid, tokenIsSetupSession } from "/imports/server/auth.js";
 import Heapdump from "heapdump";
+import { SANDSTORM_LOGDIR } from "/imports/server/constants.js";
+import { clearAdminToken, checkAuth, tokenIsValid, tokenIsSetupSession } from "/imports/server/auth.js";
+import { send as sendEmail } from "/imports/server/email.js";
+import { fillUndefinedForChangedDoc } from "/imports/server/observe-helpers.js";
 
 const publicAdminSettings = [
   "google", "github", "ldap", "saml", "emailToken", "splashUrl", "signupDialog",
@@ -26,10 +29,20 @@ const publicAdminSettings = [
   "privacyUrl", "appMarketUrl", "appIndexUrl", "appUpdatesEnabled",
   "serverTitle", "returnAddress", "ldapNameField", "organizationMembership",
   "organizationSettings",
+  "whitelabelCustomLoginProviderName",
+  "whitelabelCustomLogoAssetId",
+  "whitelabelHideSendFeedback",
+  "whitelabelHideTroubleshooting",
+  "whiteLabelHideAbout",
+  "whitelabelUseServerTitleForHomeText",
+  "quotaEnabled",
+  "quotaLdapEnabled",
+  "billingPromptUrl",
 ];
 
 const FEATURE_KEY_FIELDS_PUBLISHED_TO_ADMINS = [
   "customer", "expires", "features", "isElasticBilling", "isTrial", "issued", "userLimit",
+  "secret", "renewalProblem",
 ];
 
 const PUBLIC_FEATURE_KEY_FIELDS = [
@@ -89,6 +102,13 @@ Meteor.methods({
     Settings.upsert({ _id: "smtpConfig" }, { $set: { value: config } });
   },
 
+  disableEmail: function (token) {
+    checkAuth(token);
+
+    const db = this.connection.sandstormDb;
+    db.collections.settings.update({ _id: "smtpConfig" }, { $set: { "value.hostname": "" } });
+  },
+
   setSetting: function (token, name, value) {
     checkAuth(token);
     check(name, String);
@@ -103,37 +123,17 @@ Meteor.methods({
 
     const db = this.connection.sandstormDb;
 
-    if (!textBlock) {
-      // Delete the feature key.
-      db.collections.featureKey.remove("currentFeatureKey");
-      return;
-    }
+    // setNewFeatureKey is provided in feature-key.js
+    setNewFeatureKey(db, textBlock);
+  },
 
-    // textBlock is a base64'd string, possibly with newlines and comment lines starting with "-"
-    const featureKeyBase64 = _.chain(textBlock.split("\n"))
-        .filter(line => (line.length > 0 && line[0] !== "-"))
-        .value()
-        .join("");
+  renewFeatureKey: function (token) {
+    checkAuth(token);
 
-    const buf = new Buffer(featureKeyBase64, "base64");
-    if (buf.length < 64) {
-      throw new Meteor.Error(401, "Invalid feature key");
-    }
+    const db = this.connection.sandstormDb;
 
-    // loadSignedFeatureKey is provided in feature-key.js
-    const featureKey = loadSignedFeatureKey(buf);
-    if (!featureKey) {
-      throw new Meteor.Error(401, "Invalid feature key");
-    }
-
-    // Persist the feature key in the database.
-    db.collections.featureKey.upsert(
-      "currentFeatureKey",
-      {
-        _id: "currentFeatureKey",
-        value: buf,
-      }
-    );
+    // renewFeatureKey is provided in feature-key.js.
+    renewFeatureKey(db, { interactive: true });
   },
 
   saveOrganizationSettings(token, params) {
@@ -214,7 +214,7 @@ Meteor.methods({
     const { returnAddress, ...restConfig } = smtpConfig;
 
     try {
-      SandstormEmail.send({
+      sendEmail({
         to: to,
         from: globalDb.getServerTitle() + " <" + returnAddress + ">",
         subject: "Testing your Sandstorm's SMTP setting",
@@ -284,7 +284,7 @@ Meteor.methods({
         };
         if (typeof quota === "number") content.quota = quota;
         SignupKeys.insert(content);
-        SandstormEmail.send({
+        sendEmail({
           to: email,
           from: from,
           envelopeFrom: globalDb.getReturnAddress(),
@@ -296,38 +296,6 @@ Meteor.methods({
     }
 
     return { sent: true };
-  },
-
-  offerIpNetwork: function (token) {
-    checkAuth(token);
-    if (!isAdmin()) {
-      throw new Meteor.Error(403, "Offering IpNetwork is only allowed for logged in users " +
-        "(a token is not sufficient). Please sign in with an admin account");
-    }
-
-    const requirements = [
-      { userIsAdmin: Meteor.userId() },
-    ];
-    const sturdyRef = waitPromise(
-      saveFrontendRef({ ipNetwork: true }, { webkey: null }, requirements)
-    ).sturdyRef;
-    return ROOT_URL.protocol + "//" + globalDb.makeApiHost(sturdyRef) + "#" + sturdyRef;
-  },
-
-  offerIpInterface: function (token) {
-    checkAuth(token);
-    if (!isAdmin()) {
-      throw new Meteor.Error(403, "Offering IpInterface is only allowed for logged in users " +
-        "(a token is not sufficient). Please sign in with an admin account");
-    }
-
-    const requirements = [
-      { userIsAdmin: Meteor.userId() },
-    ];
-    const sturdyRef = waitPromise(
-      saveFrontendRef({ ipInterface: true }, { webkey: null }, requirements)
-    ).sturdyRef;
-    return ROOT_URL.protocol + "//" + globalDb.makeApiHost(sturdyRef) + "#" + sturdyRef;
   },
 
   adminToggleDisableCap: function (token, capId, value) {
@@ -424,6 +392,13 @@ Meteor.methods({
     console.log("Wrote heapdump: /opt/sandstorm" + name);
     return name;
   },
+
+  setPreinstalledApps: function (appAndPackageIds) {
+    checkAuth();
+    check(appAndPackageIds, [{ appId: String, packageId: String, }]);
+
+    this.connection.sandstormDb.setPreinstalledApps(appAndPackageIds);
+  },
 });
 
 const authorizedAsAdmin = function (token, userId) {
@@ -493,6 +468,7 @@ Meteor.publish("adminUserDetails", function (userId) {
       },
 
       changed: (newDoc, oldDoc) => {
+        fillUndefinedForChangedDoc(newDoc, oldDoc);
         this.changed("users", newDoc._id, newDoc);
       },
 
@@ -530,6 +506,8 @@ Meteor.publish("adminUserDetails", function (userId) {
       identitiesRemoved.forEach((identityId) => {
         unrefIdentity(identityId);
       });
+
+      fillUndefinedForChangedDoc(newDoc, oldDoc);
 
       this.changed("users", newDoc._id, newDoc);
     },
@@ -571,7 +549,7 @@ Meteor.publish("allPackages", function (token) {
   if (!authorizedAsAdmin(token, this.userId)) return [];
   return Packages.find({ manifest: { $exists: true } },
       { fields: { appId: 1, "manifest.appVersion": 1,
-      "manifest.actions": 1, "manifest.appTitle": 1, }, });
+      "manifest.actions": 1, "manifest.appTitle": 1, progress: 1, status: 1, }, });
 });
 
 Meteor.publish("realTimeStats", function (token) {
@@ -647,6 +625,9 @@ Meteor.publish("adminApiTokens", function (token) {
 });
 
 Meteor.publish("featureKey", function (forAdmin, token) {
+  // Note: we publish the *raw* feature key data to the client, exactly as it was loaded from the
+  // signed blob.  Any mapping from the raw data to "effective" feature key/limits should be applied
+  // in the implementation of db.currentFeatureKey().
   if (forAdmin && !authorizedAsAdmin(token, this.userId)) return [];
 
   const fields = forAdmin ? FEATURE_KEY_FIELDS_PUBLISHED_TO_ADMINS
@@ -659,6 +640,9 @@ Meteor.publish("featureKey", function (forAdmin, token) {
       // Load and verify the signed feature key.
       const buf = new Buffer(doc.value);
       const featureKey = loadSignedFeatureKey(buf);
+      if (doc.renewalProblem) {
+        featureKey.renewalProblem = doc.renewalProblem;
+      }
 
       if (featureKey) {
         // If the signature is valid, publish the feature key information.
@@ -671,6 +655,11 @@ Meteor.publish("featureKey", function (forAdmin, token) {
       // Load and reverify the new signed feature key.
       const buf = new Buffer(newDoc.value);
       const featureKey = loadSignedFeatureKey(buf);
+      if (newDoc.renewalProblem) {
+        featureKey.renewalProblem = newDoc.renewalProblem;
+      } else if (oldDoc.renewalProblem) {
+        featureKey.renewalProblem = undefined;
+      }
 
       if (featureKey) {
         // If the signature is valid, call this.changed() with the interesting fields.
@@ -716,6 +705,11 @@ Meteor.publish("hasAdmin", function (token) {
   }
 
   this.ready();
+});
+
+Meteor.publish("appIndexAdmin", function (token) {
+  if (!authorizedAsAdmin(token, this.userId)) return [];
+  return globalDb.collections.appIndex.find();
 });
 
 function observeOauthService(name) {

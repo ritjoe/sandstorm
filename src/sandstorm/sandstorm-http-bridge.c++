@@ -57,28 +57,16 @@
 
 namespace sandstorm {
 
-kj::String percentEncode(kj::StringPtr text) {
-  const char HEX_DIGITS[] = "0123456789abcdef";
-  kj::Vector<char> result;
-  for (char c: text) {
-    if (('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z') || ('0' <= c && c <= '9') ||
-        c == '-' || c == '_' || c == '.' || c == '~') {
-      result.add(c);
-    } else {
-      byte b = c;
-      result.add('%');
-      result.add(HEX_DIGITS[b/16]);
-      result.add(HEX_DIGITS[b%16]);
-    }
-  }
-  return kj::heapString(result.begin(), result.size());
-}
-
 kj::Array<byte> toBytes(kj::StringPtr text, kj::ArrayPtr<const byte> data = nullptr) {
   auto result = kj::heapArray<byte>(text.size() + data.size());
   memcpy(result.begin(), text.begin(), text.size());
   memcpy(result.begin() + text.size(), data.begin(), data.size());
   return result;
+}
+
+kj::String textIdentityId(capnp::Data::Reader id) {
+  // We truncate to 128 bits to be a little more wieldy. Still 32 chars, though.
+  return hexEncode(id.slice(0, kj::min(id.size(), 16)));
 }
 
 struct HttpStatusInfo {
@@ -158,6 +146,8 @@ std::unordered_map<uint, HttpStatusInfo> makeStatusCodes() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wglobal-constructors"
 const std::unordered_map<uint, HttpStatusInfo> HTTP_STATUS_CODES = makeStatusCodes();
+const HeaderWhitelist REQUEST_HEADER_WHITELIST(*WebSession::Context::HEADER_WHITELIST);
+const HeaderWhitelist RESPONSE_HEADER_WHITELIST(*WebSession::Response::HEADER_WHITELIST);
 #pragma clang diagnostic pop
 
 class HttpParser: public sandstorm::Handle::Server,
@@ -274,6 +264,35 @@ public:
       cookie.setHttpOnly(cookies[i].httpOnly);
     }
 
+    // Add whitelisted headers to additionalHeaders. With respect to security,
+    // the consumers of  WebSession::Response are responsible for making sure
+    // these headers are actually whitelisted. Since this bridge is included in
+    // the app package and runs in the grain itself, we cannot trust that the
+    // whitelist is correctly implemented here. An alternate implementation may
+    // not respect the whitelist. However, for the sake of building a Response
+    // that contains only valid headers, only whitelisted headers are added
+    // here.
+
+    // Add whitelisted headers, and headers matching the app prefix, to a
+    // temporary vector of headers. It is possible for a header name to appear
+    // more than once.
+    kj::Vector<Header*> headersMatching;
+    for (auto& header: headers) {
+      if (RESPONSE_HEADER_WHITELIST.matches(header.first)) {
+        headersMatching.add(&header.second);
+      }
+    }
+    // Initialize additionalHeaders once we know how many headers to include.
+    auto headerList = builder.initAdditionalHeaders(headersMatching.size());
+    // Add the headers matching the whitelist
+    int i = 0;
+    for (auto header: headersMatching) {
+      auto respHeader = headerList[i];
+      respHeader.setName(header->name);
+      respHeader.setValue(header->value);
+      i++;
+    }
+
     switch (statusInfo.type) {
       case WebSession::Response::CONTENT: {
         auto content = builder.initContent();
@@ -351,6 +370,9 @@ public:
       case WebSession::Response::NO_CONTENT: {
         auto noContent = builder.initNoContent();
         noContent.setShouldResetForm(statusInfo.noContent.shouldResetForm);
+        KJ_IF_MAYBE(etag, findHeader("etag")) {
+          parseETag(*etag, noContent.initETag());
+        }
         break;
       }
       case WebSession::Response::PRECONDITION_FAILED: {
@@ -761,6 +783,18 @@ private:
 #undef ON_DATA
 #undef ON_EVENT
 
+  static void maybePrintInvalidEtagWarning(kj::StringPtr input) {
+    static bool alreadyLoggedMessage = false;
+    if (alreadyLoggedMessage) {
+      // We already logged the message once this session, which is plenty for now.
+    } else {
+      KJ_LOG(ERROR, "HTTP protocol error, dropping ETag: app returned invalid ETag data", input);
+      KJ_LOG(ERROR, "See Sandstorm documentation: "
+             "https://docs.sandstorm.io/en/latest/search.html?q=invalid+etag+data");
+      alreadyLoggedMessage = true;
+    }
+  }
+
   static void parseETag(kj::StringPtr input, WebSession::ETag::Builder builder) {
     auto trimmed = trim(input);
     input = trimmed;
@@ -769,8 +803,11 @@ private:
       builder.setWeak(true);
     }
 
-    KJ_REQUIRE(input.startsWith("\"") && input.endsWith("\"") && input.size() > 1,
-               "app returned invalid ETag header", input);
+    // Apps sometimes send invalid ETag data. Rather than crash, we log a warning, due to #2295.
+    if (! (input.endsWith("\"") && input.size() > 1)) {
+      maybePrintInvalidEtagWarning(input);
+      return;
+    }
 
     bool escaped = false;
     kj::Vector<char> result(input.size() - 2);
@@ -778,7 +815,10 @@ private:
       if (escaped) {
         escaped = false;
       } else {
-        KJ_REQUIRE(c != '"', "app returned invalid ETag header", input);
+        if (c == '"') {
+          maybePrintInvalidEtagWarning(input);
+          return;
+        }
         if (c == '\\') {
           escaped = true;
           continue;
@@ -1012,22 +1052,227 @@ private:
   }
 };
 
-typedef std::map<kj::StringPtr, SessionContext::Client&> SessionContextMap;
-// A UiView gives each of its sessions an ID string that serves as a SessionContextMap key
-// and is sent to the app in the X-Sandstorm-Session-Id header. Each session is responsible for
-// maintaining its entry in the map. The map is used to implement a SandstormHttpBridge
-// capability.
+class BridgeContext: private kj::TaskSet::ErrorHandler {
+public:
+  BridgeContext(SandstormApi<>::Client apiCap, spk::BridgeConfig::Reader config)
+      : apiCap(kj::mv(apiCap)), config(config),
+        identitiesDir(openIdentitiesDir(config)),
+        trashDir(openTrashDir(config)), tasks(*this) {}
+
+  void saveIdentity(capnp::Data::Reader identityId, Identity::Client identity) {
+    if (!config.getSaveIdentityCaps()) return;
+
+    auto textId = textIdentityId(identityId);
+
+    kj::StringPtr textIdRef = textId;
+    if(liveIdentities.insert(std::make_pair(
+        textIdRef, IdentityRecord { kj::mv(textId), kj::cp(identity) })).second) {
+      // Newly-added to the map. Check if it's on disk.
+
+      // Note that we know now that textIdRef will live forever, since it's in the map.
+
+      if (faccessat(identitiesDir, textIdRef.cStr(), F_OK, AT_SYMLINK_NOFOLLOW) != 0) {
+        // Not yet recorded to disk. Need to save a SturdyRef.
+        saveIdentityInternal(textIdRef, kj::mv(identity));
+      } else {
+        // Try restoring the existing SturdyRef and re-save on failure.
+        tasks.add(loadIdentityFromDisk(textIdRef).whenResolved().catch_(
+            [this, textIdRef, KJ_MVCAP(identity)](auto error) mutable {
+          if (error.getType() == kj::Exception::Type::FAILED) {
+            saveIdentityInternal(textIdRef, kj::mv(identity));
+          }
+        }));
+      }
+    }
+  }
+
+  Identity::Client loadIdentity(kj::StringPtr origId) {
+    // Obtain the identity capability for the given identity ID.
+
+    KJ_REQUIRE(config.getSaveIdentityCaps(),
+        "sandstorm-http-bridge is not configured to save identity capabilities",
+        "please add `saveIdentityCaps = true` to your bridgeConfig in sandstorm-pkgdef.capnp");
+
+    // Copy string to use as map key.
+    auto textId = kj::heapString(origId);
+
+    auto iter = liveIdentities.find(textId);
+    if (iter == liveIdentities.end()) {
+      // Not in the map. Load from disk.
+      Identity::Client identity = loadIdentityFromDisk(textId);
+
+      tasks.add(identity.whenResolved().then([this, KJ_MVCAP(textId), identity]() mutable {
+        // Successfully resolved. Add to map.
+        kj::StringPtr textIdRef = textId;
+        KJ_ASSERT(liveIdentities.insert(std::make_pair(
+          textIdRef, IdentityRecord { kj::mv(textId), kj::mv(identity) })).second);
+      }, [] (auto e) {
+        // Ignore the error here because the returned capability will report it upon use.
+      }));
+
+      return kj::mv(identity);
+    } else {
+      // Identity is in the map.
+      Identity::Client identity = iter->second.identity;
+
+      // We need to verify the capability is still connected. Send a dummy call to check. We'll
+      // use a known-invalid type ID / method number and expect to get an UNIMPLEMENTED error.
+      auto ping = identity.typelessRequest(0, 65535, capnp::MessageSize { 4, 0 });
+      ping.initAsAnyStruct(0, 0);
+      return ping.send().then([identity](auto&&) mutable -> kj::Promise<Identity::Client> {
+        // Weird, we shouldn't get here.
+        KJ_LOG(ERROR, "dummy ping request should have failed with UNIMPLEMENTED");
+
+        // But clearly we are still connected, so continue.
+        return kj::mv(identity);
+      }, [this,KJ_MVCAP(textId),identity](kj::Exception&& e2) mutable
+                                      -> kj::Promise<Identity::Client> {
+        if (e2.getType() == kj::Exception::Type::DISCONNECTED) {
+          // Disconnected. We'll need to reload from disk.
+          Identity::Client newIdentity = loadIdentityFromDisk(textId);
+          tasks.add(newIdentity.whenResolved().then([this, KJ_MVCAP(textId), newIdentity]() mutable {
+            // Save the new identity to the map so that we don't have to reload it again.
+            auto iter = liveIdentities.find(textId);
+            KJ_ASSERT(iter != liveIdentities.end());
+            iter->second.identity = kj::mv(newIdentity);
+          }, [] (auto e) {
+            // Ignore the error here because the returned capability will report it upon use.
+          }));
+
+          return kj::mv(newIdentity);
+        } else {
+          // Some other error -- meaning we're NOT disconnected, so go ahead and use the cap.
+          return kj::mv(identity);
+        }
+      });
+    }
+  }
+
+  std::map<kj::StringPtr, SessionContext::Client&> sessions;
+  // TODO(cleanup): Make this private with appropriate accessor methods.
+
+private:
+  SandstormApi<>::Client apiCap;
+  spk::BridgeConfig::Reader config;
+  kj::AutoCloseFd identitiesDir;
+  kj::AutoCloseFd trashDir;
+
+  struct IdentityRecord {
+    IdentityRecord(const IdentityRecord& other) = delete;
+    IdentityRecord(IdentityRecord&& other) = default;
+
+    kj::String textId;
+    Identity::Client identity;
+  };
+  std::map<kj::StringPtr, IdentityRecord> liveIdentities;
+
+  kj::TaskSet tasks;
+
+  virtual void taskFailed(kj::Exception&& exception) override {
+    KJ_LOG(ERROR, exception);
+  }
+
+  static kj::AutoCloseFd openIdentitiesDir(spk::BridgeConfig::Reader config) {
+    if (!config.getSaveIdentityCaps()) return kj::AutoCloseFd();
+
+    recursivelyCreateParent("/var/.sandstorm-http-bridge/identities/foo");
+
+    // Note: Using O_PATH here would prevent fsync().
+    return raiiOpen("/var/.sandstorm-http-bridge/identities",
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  }
+
+  static kj::AutoCloseFd openTrashDir(spk::BridgeConfig::Reader config) {
+    if (!config.getSaveIdentityCaps()) return kj::AutoCloseFd();
+
+    recursivelyCreateParent("/var/.sandstorm-http-bridge/trash/foo");
+
+    // Note: Using O_PATH here would prevent fsync().
+    return raiiOpen("/var/.sandstorm-http-bridge/trash",
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  }
+
+  Identity::Client loadIdentityFromDisk(kj::StringPtr textId) {
+    KJ_ASSERT(textId.size() == 32, "invalid identity ID", textId);
+    for (char c: textId) {
+      if ((c < '0' || '9' < c) && (c < 'a' && 'f' < c)) {
+        KJ_FAIL_ASSERT("invalid identity ID", textId);
+      }
+    }
+
+    char buf[512];
+    ssize_t n;
+    KJ_SYSCALL(n = readlinkat(identitiesDir, textId.cStr(), buf, sizeof(buf)));
+    KJ_ASSERT(n < sizeof(buf), "token too long?");
+    buf[n] = '\0';
+
+    auto req = apiCap.restoreRequest();
+    req.setToken(percentDecode(buf));
+
+    return req.send().getCap().castAs<Identity>();
+  }
+
+  void saveIdentityInternal(kj::StringPtr textId, Identity::Client identity) {
+    // Writes the identity to disk, assuming that either we have not saved this identity yet
+    // or we have recently observed our existing save to be broken.
+
+    auto req = apiCap.saveRequest();
+    req.setCap(identity);
+    req.initLabel().setDefaultText("user identity");
+    tasks.add(req.send().then([this,textId](auto result) -> void {
+      // Sandstorm tokens are primarily text but use percent-encoding to be safe.
+      auto tokenText = percentEncode(result.getToken());
+
+      // Clean up any existing symlink.
+      dropIdentity(textId);
+
+      // Store as a symlink. ext4 can store up to 60 bytes directly in the inode, avoiding
+      // allocating a block.
+      KJ_SYSCALL(symlinkat(tokenText.cStr(), identitiesDir, textId.cStr()));
+
+      // Make sure it's really saved.
+      KJ_SYSCALL(fsync(identitiesDir));
+    }));
+  }
+
+  void dropIdentity(kj::StringPtr textId) {
+    auto symlink = kj::heapString(textId);
+
+    if (faccessat(identitiesDir, symlink.cStr(), F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
+      char buf[512];
+      ssize_t n;
+      KJ_SYSCALL(n = readlinkat(identitiesDir, symlink.cStr(), buf, sizeof(buf)));
+      KJ_ASSERT(n < sizeof(buf), "token too long?");
+      buf[n] = '\0';
+
+      // We name the trash file after the token, not the identity ID. This way, it's okay
+      // if we overwrite an existing entry of the trash directory.
+      auto trashSymlink = kj::heapString(buf);
+      KJ_SYSCALL(renameat(identitiesDir, symlink.cStr(), trashDir, trashSymlink.cStr()));
+
+      auto req = apiCap.dropRequest();
+      req.setToken(percentDecode(buf));
+      tasks.add(req.send().then([KJ_MVCAP(trashSymlink), this](auto response) -> void {
+        KJ_SYSCALL(unlinkat(trashDir, trashSymlink.cStr(), 0));
+      }));
+
+      // TODO(someday): Implement some kind of garbage collection that clears out the trash
+      // directory periodically, to handle the rare case when the above drop() task fails to
+      // run to completion.
+    }
+  }
+};
 
 class WebSessionImpl final: public WebSession::Server {
 public:
   WebSessionImpl(kj::NetworkAddress& serverAddr,
                  UserInfo::Reader userInfo, SessionContext::Client sessionContext,
-                 SessionContextMap& sessionContextMap, kj::String&& sessionId, kj::String&& tabId,
+                 BridgeContext& bridgeContext, kj::String&& sessionId, kj::String&& tabId,
                  kj::String&& basePath, kj::String&& userAgent, kj::String&& acceptLanguages,
                  kj::String&& rootPath, kj::String&& permissions, kj::Maybe<kj::String> remoteAddress)
       : serverAddr(serverAddr),
         sessionContext(kj::mv(sessionContext)),
-        sessionContextMap(sessionContextMap),
+        bridgeContext(bridgeContext),
         sessionId(kj::mv(sessionId)),
         tabId(kj::mv(tabId)),
         userDisplayName(percentEncode(userInfo.getDisplayName().getDefaultText())),
@@ -1044,14 +1289,13 @@ public:
       auto id = userInfo.getIdentityId();
       KJ_ASSERT(id.size() == 32, "Identity ID not a SHA-256?");
 
-      // We truncate to 128 bits to be a little more wieldy. Still 32 chars, though.
-      userId = hexEncode(userInfo.getIdentityId().slice(0, 16));
+      userId = textIdentityId(userInfo.getIdentityId());
     }
-    sessionContextMap.insert({kj::StringPtr(this->sessionId), this->sessionContext});
+    bridgeContext.sessions.insert({kj::StringPtr(this->sessionId), this->sessionContext});
   }
 
-  ~WebSessionImpl() {
-    sessionContextMap.erase(kj::StringPtr(sessionId));
+  ~WebSessionImpl() noexcept(false) {
+    bridgeContext.sessions.erase(kj::StringPtr(sessionId));
   }
 
   kj::Promise<void> get(GetContext context) override {
@@ -1238,7 +1482,7 @@ public:
 
     addCommonHeaders(lines, params.getContext());
 
-    auto httpRequest = toBytes(kj::strArray(lines, "\r\n"));
+    auto httpRequest = toBytes(catHeaderLines(lines));
     WebSession::WebSocketStream::Client clientStream = params.getClientStream();
     sandstorm::ByteStream::Client responseStream =
         context.getParams().getContext().getResponseStream();
@@ -1274,13 +1518,13 @@ public:
 private:
   kj::NetworkAddress& serverAddr;
   SessionContext::Client sessionContext;
-  SessionContextMap& sessionContextMap;
+  BridgeContext& bridgeContext;
   kj::String sessionId;
   kj::String tabId;
   kj::String userDisplayName;
   kj::String userHandle;
   kj::String userPicture;
-  UserInfo::Pronouns userPronouns = UserInfo::Pronouns::NEUTRAL;
+  Profile::Pronouns userPronouns = Profile::Pronouns::NEUTRAL;
   kj::Maybe<kj::String> userId;
   kj::String permissions;
   kj::String basePath;
@@ -1308,12 +1552,20 @@ private:
     if (extraHeader3 != nullptr) {
       lines.add(kj::mv(extraHeader3));
     }
-    lines.add(kj::str("Accept-Encoding: gzip"));
     if (acceptLanguages.size() > 0) {
       lines.add(kj::str("Accept-Language: ", acceptLanguages));
     }
 
     addCommonHeaders(lines, context);
+
+    return catHeaderLines(lines);
+  }
+
+  static kj::String catHeaderLines(kj::Vector<kj::String>& lines) {
+    for (auto& line: lines) {
+      KJ_ASSERT(line.findFirst('\n') == nullptr,
+                "HTTP header contained newline; blocking to prevent injection.");
+    }
 
     return kj::strArray(lines, "\r\n");
   }
@@ -1334,7 +1586,7 @@ private:
       if (userPicture.size() > 0) {
         lines.add(kj::str("X-Sandstorm-User-Picture: ", userPicture));
       }
-      capnp::EnumSchema schema = capnp::Schema::from<UserInfo::Pronouns>();
+      capnp::EnumSchema schema = capnp::Schema::from<Profile::Pronouns>();
       uint pronounValue = static_cast<uint>(userPronouns);
       auto enumerants = schema.getEnumerants();
       if (pronounValue > 0 && pronounValue < enumerants.size()) {
@@ -1376,10 +1628,33 @@ private:
     } else {
       lines.add(kj::str("Accept: */*"));
     }
+    auto acceptEncodingList = context.getAcceptEncoding();
+    if (acceptEncodingList.size() > 0) {
+      lines.add(kj::str("Accept-Encoding: ", kj::strArray(
+            KJ_MAP(c, acceptEncodingList) {
+              if (c.getQValue() == 1.0) {
+                return kj::str(c.getContentCoding());
+              } else {
+                return kj::str(c.getContentCoding(), "; q=", c.getQValue());
+              }
+            }, ", ")));
+    }
     auto additionalHeaderList = context.getAdditionalHeaders();
     if (additionalHeaderList.size() > 0) {
-      for (auto header : additionalHeaderList) {
-        lines.add(kj::str(header.getName(), ": ", header.getValue()));
+
+      for (auto header: additionalHeaderList) {
+        auto headerName = header.getName();
+        auto headerValue = header.getValue();
+
+        // Don't allow the header unless it is present in the whitelist. Note that Sandstorm never
+        // sends non-whitelisted headers, but it's possible that another app had directly obtained
+        // a WebSession capability to us, and that app could send whatever it wants, so we need
+        // to check.
+        if (REQUEST_HEADER_WHITELIST.matches(headerName)) {
+          // Note that we check elsewhere that each line contains no newlines, to prevent
+          // injections.
+          lines.add(kj::str(headerName, ": ", headerValue));
+        }
       }
     }
     auto eTagPrecondition = context.getETagPrecondition();
@@ -1669,9 +1944,9 @@ private:
 class SandstormHttpBridgeImpl: public SandstormHttpBridge::Server {
 public:
   explicit SandstormHttpBridgeImpl(SandstormApi<>::Client&& apiCap,
-                                   SessionContextMap& sessionContextMap)
+                                   BridgeContext& bridgeContext)
       : apiCap(kj::mv(apiCap)),
-        sessionContextMap(sessionContextMap) {}
+        bridgeContext(bridgeContext) {}
 
   kj::Promise<void> getSandstormApi(GetSandstormApiContext context) override {
     context.getResults().setApi(apiCap);
@@ -1680,23 +1955,39 @@ public:
 
   kj::Promise<void> getSessionContext(GetSessionContextContext context) override {
     auto id = context.getParams().getId();
-    auto iter = sessionContextMap.find(id);
-    KJ_ASSERT(iter != sessionContextMap.end(), "Session ID not found", id);
+    auto iter = bridgeContext.sessions.find(id);
+    KJ_ASSERT(iter != bridgeContext.sessions.end(), "Session ID not found", id);
     context.getResults().setContext(iter->second);
     return kj::READY_NOW;
   }
 
+  kj::Promise<void> getSavedIdentity(GetSavedIdentityContext context) override {
+    context.getResults().setIdentity(
+        bridgeContext.loadIdentity(context.getParams().getIdentityId()));
+    return kj::READY_NOW;
+  }
+
+  kj::Promise<void> saveIdentity(SaveIdentityContext context) override {
+    auto identity = context.getParams().getIdentity();
+    context.releaseParams();
+    auto request = apiCap.getIdentityIdRequest();
+    request.setIdentity(identity);
+    return request.send().then([this, KJ_MVCAP(identity)](auto response) mutable -> void {
+      bridgeContext.saveIdentity(response.getId(), kj::mv(identity));
+    });
+  }
+
 private:
   SandstormApi<>::Client apiCap;
-  SessionContextMap& sessionContextMap;
+  BridgeContext& bridgeContext;
 };
 
 class UiViewImpl final: public UiView::Server {
 public:
   explicit UiViewImpl(kj::NetworkAddress& serverAddress,
-                      SessionContextMap& sessionContextMap,
+                      BridgeContext& bridgeContext,
                       spk::BridgeConfig::Reader config)
-      : serverAddress(serverAddress), sessionContextMap(sessionContextMap), config(config) {}
+      : serverAddress(serverAddress), bridgeContext(bridgeContext), config(config) {}
 
   kj::Promise<void> getViewInfo(GetViewInfoContext context) override {
     context.setResults(config.getViewInfo());
@@ -1712,13 +2003,18 @@ public:
                (config.getApiPath().size() > 0 && sessionType == capnp::typeId<ApiSession>()),
                "Unsupported session type.");
 
+    auto userInfo = params.getUserInfo();
+    if (userInfo.hasIdentity() && config.getSaveIdentityCaps()) {
+      bridgeContext.saveIdentity(userInfo.getIdentityId(), userInfo.getIdentity());
+    }
+
     if (sessionType == capnp::typeId<WebSession>()) {
-      auto userPermissions = params.getUserInfo().getPermissions();
+      auto userPermissions = userInfo.getPermissions();
       auto sessionParams = params.getSessionParams().getAs<WebSession::Params>();
 
       context.getResults(capnp::MessageSize {2, 1}).setSession(
-          kj::heap<WebSessionImpl>(serverAddress, params.getUserInfo(), params.getContext(),
-                                   sessionContextMap, kj::str(sessionIdCounter++),
+          kj::heap<WebSessionImpl>(serverAddress, userInfo, params.getContext(),
+                                   bridgeContext, kj::str(sessionIdCounter++),
                                    hexEncode(params.getTabId()),
                                    kj::heapString(sessionParams.getBasePath()),
                                    kj::heapString(sessionParams.getUserAgent()),
@@ -1727,7 +2023,7 @@ public:
                                    formatPermissions(userPermissions),
                                    nullptr));
     } else if (sessionType == capnp::typeId<ApiSession>()) {
-      auto userPermissions = params.getUserInfo().getPermissions();
+      auto userPermissions = userInfo.getPermissions();
       auto sessionParams = params.getSessionParams().getAs<ApiSession::Params>();
       kj::Maybe<kj::String> addr = nullptr;
       if (sessionParams.hasRemoteAddress()) {
@@ -1735,8 +2031,8 @@ public:
       }
 
       context.getResults(capnp::MessageSize {2, 1}).setSession(
-          kj::heap<WebSessionImpl>(serverAddress, params.getUserInfo(), params.getContext(),
-                                   sessionContextMap, kj::str(sessionIdCounter++),
+          kj::heap<WebSessionImpl>(serverAddress, userInfo, params.getContext(),
+                                   bridgeContext, kj::str(sessionIdCounter++),
                                    hexEncode(params.getTabId()),
                                    kj::heapString(""), kj::heapString(""), kj::heapString(""),
                                    kj::heapString(config.getApiPath()),
@@ -1805,7 +2101,7 @@ private:
   }
 
   kj::NetworkAddress& serverAddress;
-  SessionContextMap& sessionContextMap;
+  BridgeContext& bridgeContext;
   spk::BridgeConfig::Reader config;
   uint sessionIdCounter = 0;
   // SessionIds are assigned sequentially.
@@ -1930,12 +2226,30 @@ public:
       // Wait until connections are accepted.
       // TODO(soon): Don't block pure-Cap'n-Proto RPCs on this. Just block HTTP requests.
       bool success = false;
+      int numTriesSoFar = 0;
+      bool loggedSlowStartupMessage = false;
       for (;;) {
         kj::runCatchingExceptions([&]() {
+          if (! loggedSlowStartupMessage) {
+            numTriesSoFar++;
+          }
           address->connect().wait(ioContext.waitScope);
           success = true;
         });
-        if (success) break;
+        if (success) {
+          if (loggedSlowStartupMessage) {
+            KJ_LOG(WARNING, "App successfully started listening for TCP connections!");
+          }
+          break;
+        }
+
+        if (!loggedSlowStartupMessage && numTriesSoFar == (30 * 100)) {
+          // After 30 seconds (30 * 100 centiseconds) of failure, log a message once.
+          KJ_LOG(WARNING, "App isn't listening for TCP connections after 30 seconds. Continuing "
+                 "to attempt to connect",
+                 address->toString());
+          loggedSlowStartupMessage = true;
+        }
 
         // Wait 10ms and try again.
         usleep(10000);
@@ -1949,24 +2263,26 @@ public:
           raiiOpen("/sandstorm-http-bridge-config", O_RDONLY), options);
       auto config = reader.getRoot<spk::BridgeConfig>();
 
-      SessionContextMap sessionContextMap;
+      auto apiPaf = kj::newPromiseAndFulfiller<SandstormApi<>::Client>();
+      BridgeContext bridgeContext(kj::mv(apiPaf.promise), config);
 
       // Set up the Supervisor API socket.
       auto stream = ioContext.lowLevelProvider->wrapSocketFd(3);
       capnp::TwoPartyVatNetwork network(*stream, capnp::rpc::twoparty::Side::CLIENT);
       auto rpcSystem = capnp::makeRpcServer(network,
-          kj::heap<UiViewImpl>(*address, sessionContextMap, config));
+          kj::heap<UiViewImpl>(*address, bridgeContext, config));
 
       // Get the SandstormApi by restoring a null SturdyRef.
       capnp::MallocMessageBuilder message;
       auto vatId = message.initRoot<capnp::rpc::twoparty::VatId>();
       vatId.setSide(capnp::rpc::twoparty::Side::SERVER);
       SandstormApi<>::Client api = rpcSystem.bootstrap(vatId).castAs<SandstormApi<>>();
+      apiPaf.fulfiller->fulfill(kj::cp(api));
 
       // Export a Unix socket on which the application can connect and make calls directly to the
       // Sandstorm API.
       SandstormHttpBridge::Client sandstormHttpBridge =
-          kj::heap<SandstormHttpBridgeImpl>(kj::mv(api), sessionContextMap);
+          kj::heap<SandstormHttpBridgeImpl>(kj::mv(api), bridgeContext);
       ErrorHandlerImpl errorHandler;
       kj::TaskSet tasks(errorHandler);
       unlink("/tmp/sandstorm-api");  // Clear stale socket, if any.

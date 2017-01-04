@@ -43,6 +43,15 @@ Then restart Sandstorm to end the interruption:
 This guide uses `$(date -I)`, which is a way to embed the current date into a filename, in a format
 such as `2005-10-30`.
 
+**Note about warnings from tar:** If you see errors involving socket files being ignored, you can
+ignore those warnings. The `tar` utility might print messages like this:
+
+```
+/opt/sandstorm/var/sandstorm/grains/bdMmGkov6gpiSSXC9GHysy/socket: socket ignored
+```
+
+You should rely on tar's **exit code** being 0 to know if the tar command completed successfully.
+
 ### To restore a Sandstorm server backup
 
 If you have a tar-based backup of `/opt/sandstorm`, the easiest way to restore it is to:
@@ -60,3 +69,8 @@ If you have a tar-based backup of `/opt/sandstorm`, the easiest way to restore i
 - Visit your Sandstorm server and make sure everything still works.
 
 - Remove the now-useless `/opt/sandstorm.empty` directory.
+
+You can also use the [Docker container
+documentation](../install.md#option-6-using-sandstorm-within-docker) to run your snapshot of
+`/opt/sandstorm`. You will need to create a Docker volume with your backup of `/opt/sandstorm`, and
+it will continue to execute until you stop the Docker container.

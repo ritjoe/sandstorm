@@ -45,10 +45,18 @@
     {{#if isUserPermitted}}
       {{> Template.dynamic template=adminTab}}
     {{else}}
-      <p>
-        You are not logged in as an admin. To access the admin panel, log in as an admin user or
-        generate a token from the command line by running `sandstorm admin-token`.
-      </p>
+      {{#if hasSetupToken}}
+        <p>
+          You are not logged in as an admin, but you do have a setup token. You can either
+          <a href="/setup">visit the setup wizard</a> or
+          <a href="/admin/status">view the system log</a>.
+        </p>
+      {{else}}
+        <p>
+          You are not logged in as an admin. To access the admin panel, log in as an admin user or
+          generate a token from the command line by running `sandstorm admin-token`.
+        </p>
+      {{/if}}
     {{/if}}
   </div>
 </template>
@@ -79,12 +87,22 @@
           {{/adminNavItem}}
           {{#adminNavItem routeName="newAdminFeatureKey"}}
             <div class="item-name">Sandstorm for Work</div>
-            <div class="item-subtext">Get a feature key and unlock advanced features.</div>
+            <div class="item-subtext">
+                {{#if hasFeatureKey }}
+                  Manage subscription and billing.
+                {{else}}
+                  Subscribe to unlock advanced features.
+                {{/if}}
+            </div>
           {{/adminNavItem}}
           {{#adminNavItem routeName="newAdminPersonalization"}}
             <div class="item-name">Personalization</div>
             <div class="item-subtext">Customize a splash page, terms of service, privacy policy,
                 etc.</div>
+          {{/adminNavItem}}
+          {{#adminNavItem routeName="newAdminPreinstalledApps"}}
+            <div class="item-name">Pre-installed apps</div>
+            <div class="item-subtext">Choose apps to pre-install for new users.</div>
           {{/adminNavItem}}
           {{#adminNavItem routeName="newAdminAppSources"}}
             <div class="item-name">App sources</div>

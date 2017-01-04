@@ -87,12 +87,13 @@ namespace sandstorm {
 // =======================================================================================
 // Directory size watcher
 
-class DiskUsageWatcher {
+class DiskUsageWatcher: private kj::TaskSet::ErrorHandler {
   // Class which watches a directory tree, counts up the total disk usage, and fires events when
   // it changes. Uses inotify. Which turns out to be... harder than it should be.
 
 public:
-  DiskUsageWatcher(kj::UnixEventPort& eventPort): eventPort(eventPort) {}
+  DiskUsageWatcher(kj::UnixEventPort& eventPort, kj::Timer& timer, SandstormCore::Client core)
+      : eventPort(eventPort), timer(timer), core(kj::mv(core)), tasks(*this) {}
 
   kj::Promise<void> init() {
     // Start watching the current directory.
@@ -116,35 +117,15 @@ public:
     return readLoop();
   }
 
-  uint64_t getSize() { return totalSize; }
-
-  kj::Promise<uint64_t> getSizeWhenChanged(uint64_t oldSize) {
-    kj::Promise<void> trigger = nullptr;
-    if (totalSize == oldSize) {
-      auto paf = kj::newPromiseAndFulfiller<void>();
-      trigger = kj::mv(paf.promise);
-      listeners.add(kj::mv(paf.fulfiller));
-    } else {
-      trigger = kj::READY_NOW;
-    }
-
-    // Even when the value has changed, wait 100ms so that we're not streaming tons of updates
-    // whenever there is heavy disk I/O. This is just for a silly display anyway.
-    return trigger.then([this]() {
-      return eventPort.atSteadyTime(eventPort.steadyTime() + 100 * kj::MILLISECONDS);
-    }).then([this]() {
-      return totalSize;
-    });
-  }
-
 private:
   kj::UnixEventPort& eventPort;
+  kj::Timer& timer;
+  SandstormCore::Client core;
   kj::AutoCloseFd inotifyFd;
   kj::Own<kj::UnixEventPort::FdObserver> observer;
   uint64_t totalSize;
-
-  uint64_t lastUpdateSize = kj::maxValue;  // value of totalSize last time listeners were fired.
-  kj::Vector<kj::Own<kj::PromiseFulfiller<void>>> listeners;
+  uint64_t reportedSize = kj::maxValue;
+  bool reportInFlight = false;
 
   struct ChildInfo {
     kj::String name;
@@ -161,6 +142,8 @@ private:
   // Directories we would like to watch, but we can't add watches on them just yet because we need
   // to finish processing a list of events received from inotify before we mess with the watch
   // descriptor table.
+
+  kj::TaskSet tasks;
 
   void addPendingWatches() {
     // Start watching everything that has been added to the pendingWatches list.
@@ -253,7 +236,7 @@ private:
 
   kj::Promise<void> readLoop() {
     addPendingWatches();
-    maybeFireEvents();
+    maybeReportSize();
     return observer->whenBecomesReadable().then([this]() {
       alignas(uint64_t) kj::byte buffer[4096];
 
@@ -343,6 +326,8 @@ private:
       iter->second.size = usage.bytes;
     }
 
+    maybeReportSize();
+
     // If the child is a directory, plan to start watching it later. Note that IN_MODIFY events
     // are not generated for subdirectories (only files), so if we got an event on a directory it
     // must be create, move to, move from, or delete. In the latter two cases, the node wouldn't
@@ -380,8 +365,8 @@ private:
         result.path = kj::mv(path);
         result.isDir = S_ISDIR(stats.st_mode);
 
-        // Round the size up to the nearest block; we assume 4k blocks.
-        result.bytes = (stats.st_size + 4095) & ~4095ull;
+        // Count blocks, not length, because what we care about is allocated space.
+        result.bytes = stats.st_blocks * 512;
 
         if (stats.st_nlink != 0) {
           // Note: sometimes the link count actually is zero; it often is, for example, during
@@ -389,10 +374,6 @@ private:
 
           // Divide by link count so that files with many hardlinks aren't overcounted.
           result.bytes /= stats.st_nlink;
-
-          // Add sizeof(stats) to approximate the directory entry overhead, and also add
-          // the size of the null-terminated filename rounded up to a word.
-          result.bytes += sizeof(stats) + ((name.size() + 8) & ~7ull);
         }
 
         return result;
@@ -414,14 +395,47 @@ private:
     }
   }
 
-  void maybeFireEvents() {
-    if (totalSize != lastUpdateSize) {
-      for (auto& listener: listeners) {
-        listener->fulfill();
-      }
-      listeners.resize(0);
-      lastUpdateSize = totalSize;
-    }
+  void maybeReportSize() {
+    // Don't send multiple reports at once. When the first one finishes we'll send another one if
+    // the size has changed in the meantime.
+    if (reportInFlight) return;
+
+    // If the last reported size is still correct, don't report.
+    if (reportedSize == totalSize) return;
+
+    reportInFlight = true;
+
+    // Wait 500ms before reporting to gather other changes.
+    tasks.add(timer.afterDelay(500 * kj::MILLISECONDS)
+        .then([this]() -> kj::Promise<void> {
+      auto req = core.reportGrainSizeRequest();
+      uint64_t sizeBeingReported = totalSize;
+      req.setBytes(sizeBeingReported);
+
+      return req.send().then([this,sizeBeingReported](auto) -> void {
+        reportInFlight = false;
+        reportedSize = sizeBeingReported;
+
+        // If the size has changed further, initiate a new report.
+        maybeReportSize();
+      }, [this](kj::Exception&& e) {
+        reportInFlight = false;
+
+        if (e.getType() == kj::Exception::Type::DISCONNECTED) {
+          // SandstormCore disconnected. Due to our CoreRedirector logic, it will restore itself
+          // eventually, and in fact further calls to SandstormCore should block until than
+          // happens. So, initiate a new report immediately.
+          maybeReportSize();
+        } else {
+          // Some other error. Propagate.
+          kj::throwFatalException(kj::mv(e));
+        }
+      });
+    }));
+  }
+
+  void taskFailed(kj::Exception&& exception) override {
+    KJ_LOG(ERROR, exception);
   }
 };
 
@@ -513,7 +527,7 @@ void registerSignalHandlers() {
   action.sa_handler = &signalHandler;
   sigfillset(&action.sa_mask);
 
-  // SIGALRM will fire every five minutes and will kill us if no keepalive was received in that
+  // SIGALRM will fire every 1.5 minutes and will kill us if no keepalive was received in that
   // time.
   KJ_SYSCALL(sigaction(SIGALRM, &action, nullptr));
 
@@ -550,6 +564,9 @@ kj::MainFunc SupervisorMain::getMain() {
                          "Runs a Sandstorm grain supervisor for the grain <grain-id>, which is "
                          "an instance of app <app-id>.  Executes <command> inside the grain "
                          "sandbox.")
+      .addOptionWithArg({"uid"}, KJ_BIND_METHOD(*this, setUid), "<uid>",
+                        "Use setuid sandbox rather than userns. Must start as root, but swiches "
+                        "to <uid> to run the app.")
       .addOptionWithArg({"pkg"}, KJ_BIND_METHOD(*this, setPkg), "<path>",
                         "Set directory containing the app package.  "
                         "Defaults to '$SANDSTORM_HOME/var/sandstorm/apps/<app-name>'.")
@@ -617,6 +634,22 @@ kj::MainBuilder::Validity SupervisorMain::setVar(kj::StringPtr path) {
   return true;
 }
 
+kj::MainBuilder::Validity SupervisorMain::setUid(kj::StringPtr arg) {
+  KJ_IF_MAYBE(u, parseUInt(arg, 10)) {
+    if (getuid() != 0) {
+      return "must start as root to use --uid";
+    }
+    if (*u == 0) {
+      return "can't run sandbox as root";
+    }
+    KJ_SYSCALL(seteuid(*u));
+    sandboxUid = *u;
+    return true;
+  } else {
+    return "UID must be a number";
+  }
+}
+
 kj::MainBuilder::Validity SupervisorMain::addEnv(kj::StringPtr arg) {
   environment.add(kj::heapString(arg));
   return true;
@@ -637,7 +670,11 @@ kj::MainBuilder::Validity SupervisorMain::run() {
   // Exits if another supervisor is still running in this sandbox.
   systemConnector->checkIfAlreadyRunning();
 
-  SANDSTORM_LOG("Starting up grain.");
+  if (sandboxUid == nullptr) {
+    SANDSTORM_LOG("Starting up grain. Sandbox type: userns");
+  } else {
+    SANDSTORM_LOG("Starting up grain. Sandbox type: privileged");
+  }
 
   registerSignalHandlers();
 
@@ -855,17 +892,45 @@ void SupervisorMain::writeUserNSMap(const char *type, kj::StringPtr contents) {
 }
 
 void SupervisorMain::unshareOuter() {
-  pid_t uid = getuid(), gid = getgid();
+  if (sandboxUid == nullptr) {
+    // Use user namespaces.
+    pid_t uid = getuid(), gid = getgid();
 
-  // Unshare all of the namespaces except network.  Note that unsharing the pid namespace is a
-  // little odd in that it doesn't actually affect this process, but affects later children
-  // created by it.
-  KJ_SYSCALL(unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWPID));
+    // Unshare all of the namespaces except network.  Note that unsharing the pid namespace is a
+    // little odd in that it doesn't actually affect this process, but affects later children
+    // created by it.
+    KJ_SYSCALL(unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWPID));
 
-  // Map ourselves as 1000:1000, since it costs nothing to mask the uid and gid.
-  writeSetgroupsIfPresent("deny\n");
-  writeUserNSMap("uid", kj::str("1000 ", uid, " 1\n"));
-  writeUserNSMap("gid", kj::str("1000 ", gid, " 1\n"));
+    // Map ourselves as 1000:1000, since it costs nothing to mask the uid and gid.
+    uid_t fakeUid = 1000;
+    gid_t fakeGid = 1000;
+
+    if (devmode) {
+      // "Randomize" the UID and GID in dev mode. This catches app bugs where the app expects the
+      // UID or GID to be always 1000, which is not true of servers that use the privileged sandbox
+      // rather than the userns sandbox. (The "randomization" algorithm here is only meant to
+      // appear random to a human. The funny-looking numbers are just arbitrary primes chosen
+      // without much thought.)
+      time_t now = time(nullptr);
+      fakeUid = now * 4721 % 2000 + 1;
+      fakeGid = now * 2791 % 2000 + 1;
+    }
+
+    writeSetgroupsIfPresent("deny\n");
+    writeUserNSMap("uid", kj::str(fakeUid, " ", uid, " 1\n"));
+    writeUserNSMap("gid", kj::str(fakeGid, " ", gid, " 1\n"));
+  } else {
+    // Use root privileges instead of user namespaces.
+
+    // We need to raise our privileges to call unshare(), and to perform other setup that occurs
+    // after unshare().
+    KJ_SYSCALL(seteuid(0));
+
+    // Unshare all of the namespaces except network.  Note that unsharing the pid namespace is a
+    // little odd in that it doesn't actually affect this process, but affects later children
+    // created by it.
+    KJ_SYSCALL(unshare(CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWPID));
+  }
 
   // To really unshare the mount namespace, we also have to make sure all mounts are private.
   // The parameters here were derived by strace'ing `mount --make-rprivate /`.  AFAICT the flags
@@ -1441,18 +1506,23 @@ void SupervisorMain::maybeFinishMountingProc() {
 }
 
 void SupervisorMain::permanentlyDropSuperuser() {
-  // Drop all Linux "capabilities".  (These are Linux/POSIX "capabilities", which are not true
-  // object-capabilities, hence the quotes.)
-  //
-  // This unfortunately must be performed post-fork (in both parent and child), because the child
-  // needs to do one final unshare().
+  KJ_IF_MAYBE(ruid, sandboxUid) {
+    // setuid() to non-zero implicitly drops capabilities.
+    KJ_SYSCALL(setresuid(*ruid, *ruid, *ruid));
+  } else {
+    // Drop all Linux "capabilities".  (These are Linux/POSIX "capabilities", which are not true
+    // object-capabilities, hence the quotes.)
+    //
+    // This unfortunately must be performed post-fork (in both parent and child), because the child
+    // needs to do one final unshare().
 
-  struct __user_cap_header_struct hdr;
-  struct __user_cap_data_struct data[2];
-  hdr.version = _LINUX_CAPABILITY_VERSION_3;
-  hdr.pid = 0;
-  memset(data, 0, sizeof(data));  // All capabilities disabled!
-  KJ_SYSCALL(capset(&hdr, data));
+    struct __user_cap_header_struct hdr;
+    struct __user_cap_data_struct data[2];
+    hdr.version = _LINUX_CAPABILITY_VERSION_3;
+    hdr.pid = 0;
+    memset(data, 0, sizeof(data));  // All capabilities disabled!
+    KJ_SYSCALL(capset(&hdr, data));
+  }
 
   // Sandstorm data is private.  Don't let other users see it.  But, do grant full access to the
   // group.  The idea here is that you might have a dedicated sandstorm-sandbox user account but
@@ -1537,11 +1607,13 @@ void SupervisorMain::DefaultSystemConnector::checkIfAlreadyRunning() const {
 [[noreturn]] void SupervisorMain::runChild(int apiFd, kj::AutoCloseFd startEventFd) {
   // We are the child.
 
-  // Wait until we get the signal to start.
+  enterSandbox();
+
+  // Wait until we get the signal to start. (It's important to do this after entering the sandbox
+  // so that the parent process has permission to send SIGKILL to the child even in
+  // privileged-mode.)
   uint64_t dummy;
   KJ_SYSCALL(read(startEventFd, &dummy, sizeof(dummy)));
-
-  enterSandbox();
 
   // Reset all signal handlers to default.  (exec() will leave ignored signals ignored, and KJ
   // code likes to ignore e.g. SIGPIPE.)
@@ -1801,6 +1873,7 @@ public:
 
   kj::Promise<void> save(SaveContext context) override {
     auto args = context.getParams();
+    KJ_REQUIRE(args.hasCap(), "Cannot save a null capability.");
     auto req = args.getCap().template castAs<SystemPersistent>().saveRequest();
     auto grainOwner = req.getSealFor().initGrain();
     grainOwner.setGrainId(grainId);
@@ -1813,7 +1886,6 @@ public:
   kj::Promise<void> restore(RestoreContext context) override {
     auto req = sandstormCore.restoreRequest();
     req.setToken(context.getParams().getToken());
-    req.setRequiredPermissions(context.getParams().getRequiredPermissions());
     return req.send().then([context](auto args) mutable -> void {
       context.getResults().setCap(args.getCap());
     });
@@ -1880,6 +1952,24 @@ public:
     });
   }
 
+  kj::Promise<void> backgroundActivity(BackgroundActivityContext context) override {
+    auto params = context.getParams();
+    auto req = sandstormCore.backgroundActivityRequest(params.totalSize());
+    req.setEvent(params.getEvent());
+    context.releaseParams();
+    return req.send().ignoreResult();
+  }
+
+  kj::Promise<void> getIdentityId(GetIdentityIdContext context) override {
+    auto params = context.getParams();
+    auto req = sandstormCore.getIdentityIdRequest(params.totalSize());
+    req.setIdentity(params.getIdentity());
+    context.releaseParams();
+    return req.send().then([context](auto args) mutable -> void {
+      context.getResults().setId(args.getId());
+    });
+  }
+
 private:
   void dropHandle(kj::ArrayPtr<byte> sturdyRef) {
     auto req = sandstormCore.dropRequest();
@@ -1917,10 +2007,9 @@ private:
 class SupervisorMain::SupervisorImpl final: public Supervisor::Server {
 public:
   inline SupervisorImpl(kj::UnixEventPort& eventPort, MainView<>::Client&& mainView,
-                        DiskUsageWatcher& diskWatcher, WakelockSet& wakelockSet,
-                        kj::AutoCloseFd startAppEvent, SandstormCore::Client sandstormCore,
-                        kj::Own<CapRedirector> coreRedirector)
-      : eventPort(eventPort), mainView(kj::mv(mainView)), diskWatcher(diskWatcher),
+                        WakelockSet& wakelockSet, kj::AutoCloseFd startAppEvent,
+                        SandstormCore::Client sandstormCore, kj::Own<CapRedirector> coreRedirector)
+      : eventPort(eventPort), mainView(kj::mv(mainView)),
         wakelockSet(wakelockSet), sandstormCore(sandstormCore),
         coreRedirector(kj::mv(coreRedirector)), startAppEvent(kj::mv(startAppEvent)) {}
 
@@ -1950,19 +2039,6 @@ public:
   kj::Promise<void> shutdown(ShutdownContext context) override {
     SANDSTORM_LOG("Grain shutdown requested.");
     killChildAndExit(0);
-  }
-
-  kj::Promise<void> getGrainSize(GetGrainSizeContext context) override {
-    context.getResults(capnp::MessageSize { 2, 0 }).setSize(diskWatcher.getSize());
-    return kj::READY_NOW;
-  }
-
-  kj::Promise<void> getGrainSizeWhenDifferent(GetGrainSizeWhenDifferentContext context) override {
-    auto oldSize = context.getParams().getOldSize();
-    context.releaseParams();
-    return diskWatcher.getSizeWhenChanged(oldSize).then([context](uint64_t size) mutable {
-      context.getResults(capnp::MessageSize { 2, 0 }).setSize(size);
-    });
   }
 
   kj::Promise<void> watchLog(WatchLogContext context) override {
@@ -2070,7 +2146,6 @@ public:
 private:
   kj::UnixEventPort& eventPort;
   MainView<>::Client mainView;
-  DiskUsageWatcher& diskWatcher;
   WakelockSet& wakelockSet;
   SandstormCore::Client sandstormCore;
   kj::Own<CapRedirector> coreRedirector;
@@ -2235,8 +2310,9 @@ kj::Promise<void> SupervisorMain::DefaultSystemConnector::run(
   SandstormCore::Client coreCap = static_cast<capnp::Capability::Client>(
     kj::addRef(*coreRedirector)).castAs<SandstormCore>();
   SupervisorRealmGateway::Client gateway = kj::heap<SupervisorRealmGatewayImpl>(coreCap);
+
   // Compute grain size and watch for changes.
-  DiskUsageWatcher diskWatcher(ioContext.unixEventPort);
+  DiskUsageWatcher diskWatcher(ioContext.unixEventPort, ioContext.provider->getTimer(), coreCap);
   auto diskWatcherTask = diskWatcher.init();
 
   // Set up the RPC connection to the app and export the supervisor interface.
@@ -2263,7 +2339,7 @@ kj::Promise<void> SupervisorMain::DefaultSystemConnector::run(
   //   want to wrap the UiView and cache session objects.  Perhaps we could do this by making
   //   them persistable, though it's unclear how that would work with SessionContext.
   Supervisor::Client mainCap = kj::heap<SupervisorImpl>(
-      ioContext.unixEventPort, kj::mv(app), diskWatcher, wakelockSet, kj::mv(startEventFd),
+      ioContext.unixEventPort, kj::mv(app), wakelockSet, kj::mv(startEventFd),
       coreCap, kj::addRef(*coreRedirector));
 
   auto acceptTask = systemConnector->run(ioContext, kj::mv(mainCap), kj::mv(coreRedirector));

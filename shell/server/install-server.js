@@ -14,41 +14,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { allowDemo } from "/imports/demo.js";
+import { promiseToFuture } from "/imports/server/async-helpers.js";
+
 const localizedTextPattern = {
   defaultText: String,
   localizations: Match.Optional([{ locale: String, text: String }]),
 };
 
 const uploadTokens = {};
-
-UserActions.allow({
-  insert: function (userId, action) {
-    // TODO(cleanup): This check keeps breaking. Use a method instead that takes the package
-    //   ID as an argument.
-    check(action, {
-      userId: String,
-      packageId: String,
-      appId: String,
-      appTitle: Match.Optional(localizedTextPattern),
-      appMarketingVersion: Match.Optional(Object),
-      appVersion: Match.Integer,
-      title: localizedTextPattern,
-      nounPhrase: Match.Optional(localizedTextPattern),
-      command: {
-        executablePath: Match.Optional(String),
-        deprecatedExecutablePath: Match.Optional(String),
-        args: Match.Optional([String]),
-        argv: Match.Optional([String]),
-        environ: Match.Optional([{ key: String, value: String }]),
-      },
-    });
-    return userId && isSignedUpOrDemo() && action.userId === userId;
-  },
-
-  remove: function (userId, action) {
-    return userId && action.userId === userId;
-  },
-});
 
 // Not all users are allowed to upload apps. We need to manually implement authorization
 // because Meteor.userId() is not available in server-side routes.
@@ -97,12 +71,9 @@ Meteor.methods({
       } else { // jscs:ignore disallowEmptyBlocks
         throw new Meteor.Error(403, "You must be logged in to install packages.");
       }
-    } else if (!isSignedUp() && !isDemoUser()) {
+    } else if (!isSignedUpOrDemo()) {
       throw new Meteor.Error(403,
           "This Sandstorm server requires you to get an invite before installing apps.");
-    } else if (isUserOverQuota(Meteor.user())) {
-      throw new Meteor.Error(402,
-          "You are out of storage space. Please delete some things and try again.");
     }
 
     const pkg = Packages.findOne(packageId);
@@ -121,6 +92,22 @@ Meteor.methods({
       globalDb.startInstall(packageId, url, isRetry);
     }
   },
+});
+
+Meteor.publish("packageInfo", function (packageId) {
+  check(packageId, String);
+  const db = this.connection.sandstormDb;
+  const pkgCursor = db.collections.packages.find(packageId);
+  const pkg = pkgCursor.fetch()[0];
+  if (pkg && this.userId) {
+    return [
+      pkgCursor,
+      db.collections.userActions.find({ userId: this.userId, appId: pkg.appId }),
+      db.collections.grains.find({ userId: this.userId, appId: pkg.appId }),
+    ];
+  } else {
+    return pkgCursor;
+  }
 });
 
 Router.map(function () {

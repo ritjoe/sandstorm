@@ -28,12 +28,16 @@
   {{/if}}
 
   <form class="setup-idp-form">
-    <p>To use email login, you'll also need to configure an email relay.</p>
+    {{#if emailUnconfigured}}
+      <p class="flash-message warning-message">Note: to use email login, you'll need to configure email delivery after this.</p>
+    {{/if}}
+
+    <p>Email login has no additional configuration options.</p>
   </form>
 
   <div class="idp-modal-button-row">
     <button class="idp-modal-save">
-      {{#if emailEnabled}}
+      {{#if emailLoginEnabled}}
       Save
       {{else}}
       Enable
@@ -42,7 +46,7 @@
     <button class="idp-modal-cancel">
       Cancel
     </button>
-    {{#if emailEnabled}}
+    {{#if emailLoginEnabled}}
     <button class="idp-modal-disable">
       Disable
     </button>
@@ -71,6 +75,16 @@
 {{#modalDialogWithBackdrop onDismiss=onDismiss}}
   <h2>Google login configuration</h2>
 
+  {{#if formerBaseUrl}}
+    <p class="flash-message warning-message" tabindex="-1">
+      This server moved from <code>{{ formerBaseUrl }}</code> to <code>{{ siteUrlNoSlash }}</code>.
+      You'll need to visit
+      <a target="_blank" href="https://console.developers.google.com/">https://console.developers.google.com/</a>
+      and update the "Authorized Javascript Origins" and "Authorized Redirect URI" for this Client ID to
+      include the values below.
+    </p>
+  {{/if}}
+
   {{#if errorMessage}}
     {{#focusingErrorBox}}
       Failed to save changes: {{errorMessage}}
@@ -78,7 +92,7 @@
   {{/if}}
 
   <form class="setup-idp-form">
-    {{> googleLoginSetupInstructions }}
+    {{> googleLoginSetupInstructions "" }}
 
     <p>Then, copy over your Client ID and Client secret below:</p>
 
@@ -131,8 +145,17 @@
 {{#modalDialogWithBackdrop onDismiss=onDismiss}}
   <h2>GitHub login configuration</h2>
 
+  {{#if formerBaseUrl}}
+    <p class="flash-message warning-message" tabindex="-1">
+      This server moved from <code>{{ formerBaseUrl }}</code> to <code>{{ siteUrl }}</code>.
+      You'll need to visit
+      <a target="_blank" href="https://github.com/settings/developers">https://github.com/settings/developers</a>
+      and update the Homepage URL and Authorization callback URL for this application to the values below.
+    </p>
+  {{/if}}
+
   <form class="setup-idp-form">
-    {{> githubLoginSetupInstructions }}
+    {{> githubLoginSetupInstructions "" }}
 
     <p>Then, copy over your Client ID and Client secret below:</p>
     <div class="form-group">
@@ -202,7 +225,7 @@
 
     <div class="form-group">
       <label>Bind user password
-        <input type="text" name="ldapSearchBindPassword" value="{{ldapSearchBindPassword}}"/>
+        <input type="password" name="ldapSearchBindPassword" value="{{ldapSearchBindPassword}}"/>
       </label>
       <span class="form-subtext">
         Optional, needed if specifying bind DN above.
@@ -257,6 +280,17 @@
       </span>
     </div>
 
+    <div class="form-group">
+      <label>LDAP CA certificate
+        <textarea name="ldapCaCert" value="{{ldapCaCert}}" placeholder="-----BEGIN CERTIFICATE-----
+MIID...
+-----END CERTIFICATE-----"></textarea>
+      </label>
+      <span class="form-subtext">
+        This is only necessary if your server supports SSL and is using a private CA not in the common trusted set. Note that it does NOT work to enter the LDAP server's own certificate here -- it must be the certificate of a CA which has signed the LDAP server's certificate.
+      </span>
+    </div>
+
   </form>
 
   <div class="idp-modal-button-row">
@@ -294,6 +328,10 @@
   </p>
 
   <p>
+    The Service Logout URL of this server is: <code>{{ logoutUrl }}</code>
+  </p>
+
+  <p>
     If your SAML IDP supports reading the service provider metadata from a URL, then you can point it at: <code><a href="{{configUrl}}" target="_blank">{{ configUrl }}</a></code>
   </p>
 
@@ -307,6 +345,12 @@
     <div class="form-group">
       <label>SAML provider entry point URL:
         <input type="text" name="entryPoint" value="{{samlEntryPoint}}" placeholder="https://YOUR_SAML_PROVIDER.com/sso/saml" />
+      </label>
+    </div>
+
+    <div class="form-group">
+      <label>SAML provider logout URL (optional):
+        <input type="text" name="logout" value="{{samlLogout}}" placeholder="https://YOUR_SAML_PROVIDER.com/sso/saml/SingleLogoutService" />
       </label>
     </div>
 
@@ -374,17 +418,28 @@
 <div class="idp-table-row" role="row">
   <span class="idp" role="gridcell">{{idp.label}}</span>
   <span class="idp-status" role="gridcell">
+    <span class="left">
     {{#if idp.enabled}}
       <span class="idp-enabled">Enabled</span>
     {{else}}
       <span class="idp-disabled">Not enabled</span>
     {{/if}}
+    {{#if idp.resetNote}}
+      {{#if idp.resetNote.baseUrlChangedFrom}}
+      <span class="base-url-change-note">
+        Disabled due to BASE_URL change <button class="button-link base-url-change-button">reconfigure</button>
+      </span>
+      {{/if}}
+    {{/if}}
+    </span>
 
+    <span class="right">
     {{#if needsFeatureKey}}
       <button class="get-feature-key" title="Configure Sandstorm for Work">Configure Sandstorm for Work</button>
     {{else}}
       <button class="configure-idp" title="Configure {{idp.label}} login">Configure</button>
     {{/if}}
+    </span>
   </span>
 </div>
 </template>
